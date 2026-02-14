@@ -39,8 +39,12 @@ class Tools:
             description="OpenAI API key for generating query embeddings"
         )
         TOP_K: int = Field(
-            default=5,
-            description="Number of results to return per collection"
+            default=8,
+            description="Maximum total number of results to return"
+        )
+        PER_ARTICLE_MAX: int = Field(
+            default=2,
+            description="Preferred max results per article/episode (may exceed if total budget remains)"
         )
         WALLABAG_COLLECTION: str = Field(
             default="wallabag_articles",
@@ -177,6 +181,50 @@ class Tools:
                 })
             return error_msg
 
+    @staticmethod
+    def _article_key(point) -> str:
+        """Return a grouping key for a result point (article ID, episode name, etc.)."""
+        payload = point.payload
+        source = payload.get("source", "unknown")
+        if source == "wallabag":
+            return f"wallabag:{payload.get('article_id', payload.get('title', 'unknown'))}"
+        elif source == "podcast_transcript":
+            return f"podcast:{payload.get('show_name', '')}:{payload.get('episode_name', '')}"
+        return f"other:{payload.get('title', id(point))}"
+
+    @staticmethod
+    def _diversified_top_k(results: list, total_max: int, per_article_max: int) -> list:
+        """
+        Select up to total_max results, preferring at most per_article_max per article.
+
+        Pass 1: iterate by score, accepting each result until that article hits
+                 per_article_max. Deferred results go to a spillover list.
+        Pass 2: if the total budget isn't filled, pull from spillover (still
+                 sorted by score) regardless of per-article counts.
+        """
+        selected = []
+        spillover = []
+        article_counts: dict[str, int] = {}
+
+        for point in results:
+            if len(selected) >= total_max:
+                break
+            key = Tools._article_key(point)
+            count = article_counts.get(key, 0)
+            if count < per_article_max:
+                selected.append(point)
+                article_counts[key] = count + 1
+            else:
+                spillover.append(point)
+
+        # Fill remaining budget from spillover (already in score order)
+        for point in spillover:
+            if len(selected) >= total_max:
+                break
+            selected.append(point)
+
+        return selected
+
     async def search_knowledge(
         self,
         query: str,
@@ -238,10 +286,12 @@ class Tools:
 
             for coll_name in collections:
                 try:
+                    # Fetch extra candidates to allow diversification across articles
+                    fetch_limit = self.valves.TOP_K * 3
                     results = qdrant.query_points(
                         collection_name=coll_name,
                         query=query_vector,
-                        limit=self.valves.TOP_K
+                        limit=fetch_limit
                     )
                     all_results.extend(results.points)
                 except Exception as e:
@@ -251,9 +301,11 @@ class Tools:
                             "data": {"description": f"Warning: Could not search {coll_name}: {e}"}
                         })
 
-            # Sort by score and take top K overall
+            # Diversified top-K: respect per-article limits while filling total budget
             all_results.sort(key=lambda x: x.score, reverse=True)
-            top_results = all_results[:self.valves.TOP_K]
+            top_results = self._diversified_top_k(
+                all_results, self.valves.TOP_K, self.valves.PER_ARTICLE_MAX
+            )
 
             if not top_results:
                 return "No relevant information found in the knowledge base."
