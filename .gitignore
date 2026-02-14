@@ -1,0 +1,29 @@
+# Virtual environment
+venv/
+.venv/
+
+# Configuration with secrets
+config/.env
+
+# Sync state files
+config/.*_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
