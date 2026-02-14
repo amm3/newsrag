@@ -12,6 +12,7 @@ import argparse
 import logging
 import hashlib
 import json
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -28,8 +29,12 @@ LOGGING_FORMAT = '%(asctime)s:%(levelname)s:%(message)s'
 
 
 def main():
+    # Load .env early so env vars are available for argument defaults
+    config_dir = Path(os.environ.get('QDRANT_LOADER_CONFIG_DIR', Path(__file__).parent.parent / 'config'))
+    load_dotenv(config_dir / '.env')
+
     parser = argparse.ArgumentParser(description='Podcast Transcript to Qdrant Ingestion')
-    parser.add_argument("--podcast-dir", required=True, help="Root directory containing podcasts")
+    parser.add_argument("--podcast-dir", default=os.environ.get('PODCAST_DIR'), required=not os.environ.get('PODCAST_DIR'), help="Root directory containing podcasts")
     parser.add_argument("-v", action="store_true", default=False, help="Print extra info")
     parser.add_argument("-vv", action="store_true", default=False, help="Print (more) extra info")
     parser.add_argument("--full", action="store_true", help="Full re-sync (ignore state)")
@@ -42,10 +47,6 @@ def main():
         logging.basicConfig(format=LOGGING_FORMAT, datefmt=DEFAULT_TIME_FORMAT, level=logging.INFO)
     else:
         logging.basicConfig(format=LOGGING_FORMAT, datefmt=DEFAULT_TIME_FORMAT, level=logging.WARNING)
-
-    # Load configuration
-    config_dir = Path(os.environ.get('QDRANT_LOADER_CONFIG_DIR', Path(__file__).parent.parent / 'config'))
-    load_dotenv(config_dir / '.env')
 
     # Validate required config
     required_vars = ['QDRANT_URL', 'OPENAI_API_KEY']
@@ -63,10 +64,12 @@ def main():
     state_file = config_dir / '.podcast_sync_state.json'
 
     # Initialize clients
-    qdrant = QdrantClient(
-        url=os.environ['QDRANT_URL'],
-        api_key=os.environ.get('QDRANT_API_KEY')
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='Api key is used with an insecure connection')
+        qdrant = QdrantClient(
+            url=os.environ['QDRANT_URL'],
+            api_key=os.environ.get('QDRANT_API_KEY')
+        )
 
     openai_client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
 

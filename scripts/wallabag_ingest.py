@@ -14,7 +14,8 @@ import time
 import hashlib
 import json
 import re
-from datetime import datetime
+import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -74,10 +75,12 @@ def main():
         password=os.environ['WALLABAG_PASSWORD']
     )
 
-    qdrant = QdrantClient(
-        url=os.environ['QDRANT_URL'],
-        api_key=os.environ.get('QDRANT_API_KEY')
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='Api key is used with an insecure connection')
+        qdrant = QdrantClient(
+            url=os.environ['QDRANT_URL'],
+            api_key=os.environ.get('QDRANT_API_KEY')
+        )
 
     openai_client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
 
@@ -118,7 +121,7 @@ def main():
     # Save state
     if not args.dry_run:
         with open(state_file, 'w') as f:
-            json.dump({'last_sync': datetime.utcnow().isoformat()}, f)
+            json.dump({'last_sync': datetime.now(timezone.utc).isoformat()}, f)
 
     logging.warning(f"Completed: {len(articles)} articles, {total_chunks} chunks indexed")
     return 0
