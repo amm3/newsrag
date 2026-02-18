@@ -7,6 +7,7 @@
 # Usage:
 #   ./run.sh wallabag [options]      - Run Wallabag ingestion
 #   ./run.sh podcasts [options]      - Run podcast transcript ingestion
+#   ./run.sh papers [options]        - Run papers/documents ingestion
 #   ./run.sh help                    - Show this help
 #
 
@@ -46,6 +47,7 @@ Usage: ./run.sh <command> [options]
 Commands:
   wallabag    Ingest articles from Wallabag
   podcasts    Ingest podcast transcripts from filesystem
+  papers      Ingest papers/documents from filesystem
   help        Show this help message
 
 Wallabag Options:
@@ -61,11 +63,20 @@ Podcast Options:
   -v                   Verbose output
   -vv                  Debug output
 
+Papers Options:
+  --papers-dir PATH    Directory containing papers/documents (required)
+  --full               Full re-sync (ignore state file)
+  --dry-run            Don't write to Qdrant
+  -v                   Verbose output
+  -vv                  Debug output
+
 Examples:
   ./run.sh wallabag -v
   ./run.sh wallabag --full --dry-run -v
   ./run.sh podcasts --podcast-dir /mnt/nas/podcasts -v
   ./run.sh podcasts --podcast-dir /mnt/nas/podcasts --full -v
+  ./run.sh papers --papers-dir /mnt/nas/papers -v
+  ./run.sh papers --papers-dir /mnt/nas/papers --full -v
 
 State files are stored in $CONFIG_DIR/
 Delete them to force a full re-sync.
@@ -80,6 +91,10 @@ case "${1:-help}" in
     podcasts|podcast)
         shift
         exec python "$SCRIPT_DIR/scripts/podcast_ingest.py" "$@"
+        ;;
+    papers|paper)
+        shift
+        exec python "$SCRIPT_DIR/scripts/papers_ingest.py" "$@"
         ;;
     help|--help|-h)
         show_help

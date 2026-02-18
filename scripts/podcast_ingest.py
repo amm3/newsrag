@@ -96,7 +96,7 @@ def main():
     if args.full:
         new_files = transcript_files
     else:
-        new_files = [f for f in transcript_files if str(f) not in processed_files]
+        new_files = [(t, a) for t, a in transcript_files if str(t) not in processed_files]
 
     logging.info(f"Found {len(transcript_files)} transcripts, {len(new_files)} to process")
 
@@ -108,10 +108,10 @@ def main():
     total_chunks = 0
     newly_processed = []
 
-    for i, transcript_path in enumerate(new_files, 1):
+    for i, (transcript_path, audio_path) in enumerate(new_files, 1):
         try:
             chunks = process_transcript(
-                transcript_path, podcast_dir, openai_client,
+                transcript_path, audio_path, podcast_dir, openai_client,
                 qdrant, collection_name,
                 chunk_size, chunk_overlap, embedding_model, args.dry_run
             )
@@ -134,21 +134,28 @@ def main():
     return 0
 
 
-def find_transcripts(root_dir: Path) -> list[Path]:
-    """Find all .txt files that have corresponding audio files"""
+def find_transcripts(root_dir: Path) -> list[tuple[Path, Path]]:
+    """Find all .txt files that have corresponding audio files.
+
+    Returns list of (transcript_path, audio_path) tuples.
+    """
     transcripts = []
-    audio_extensions = {'.mp3', '.m4a', '.wav', '.ogg', '.flac'}
+    audio_extensions = ['.mp3', '.m4a', '.wav', '.ogg', '.flac']
 
     for txt_file in root_dir.rglob("*.txt"):
-        # Check for corresponding audio file
-        has_audio = any(txt_file.with_suffix(ext).exists() for ext in audio_extensions)
+        audio_file = None
+        for ext in audio_extensions:
+            candidate = txt_file.with_suffix(ext)
+            if candidate.exists():
+                audio_file = candidate
+                break
 
-        if has_audio:
-            transcripts.append(txt_file)
+        if audio_file is not None:
+            transcripts.append((txt_file, audio_file))
         else:
             logging.debug(f"Skipping {txt_file}: no audio counterpart")
 
-    return sorted(transcripts)
+    return sorted(transcripts, key=lambda pair: pair[0])
 
 
 def ensure_collection(client: QdrantClient, collection_name: str, dimensions: int = 1536):
@@ -206,7 +213,7 @@ def get_embeddings(texts: list[str], client: OpenAI, model: str) -> list[list[fl
     return [item.embedding for item in response.data]
 
 
-def process_transcript(transcript_path: Path, root_dir: Path,
+def process_transcript(transcript_path: Path, audio_path: Path, root_dir: Path,
                        openai_client: OpenAI, qdrant: QdrantClient,
                        collection_name: str,
                        chunk_size: int, chunk_overlap: int, embedding_model: str,
@@ -274,6 +281,7 @@ def process_transcript(transcript_path: Path, root_dir: Path,
                     'show_name': show_name,
                     'episode_name': episode_name,
                     'file_path': str(relative_path),
+                    'audio_file': str(audio_path.relative_to(root_dir)),
                     'text': chunk,
                     'modified_at': mtime,
                     'source': 'podcast_transcript'
