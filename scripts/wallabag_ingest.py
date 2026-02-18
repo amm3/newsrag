@@ -35,7 +35,10 @@ def main():
     parser = argparse.ArgumentParser(description='Wallabag to Qdrant Ingestion')
     parser.add_argument("-v", action="store_true", default=False, help="Print extra info")
     parser.add_argument("-vv", action="store_true", default=False, help="Print (more) extra info")
-    parser.add_argument("--full", action="store_true", help="Full re-sync (ignore state)")
+    sync_mode = parser.add_mutually_exclusive_group()
+    sync_mode.add_argument("--full", action="store_true", help="Full re-sync (ignore state)")
+    sync_mode.add_argument("--entries", type=int, nargs='+', metavar='ID',
+                           help="Reprocess specific Wallabag entry IDs")
     parser.add_argument("--dry-run", action="store_true", help="Don't write to Qdrant")
     args = parser.parse_args()
 
@@ -88,18 +91,28 @@ def main():
     if not args.dry_run:
         ensure_collection(qdrant, collection_name)
 
-    # Load sync state
-    last_sync = None
-    if not args.full and state_file.exists():
-        with open(state_file) as f:
-            state = json.load(f)
-            last_sync = state.get('last_sync')
-            logging.info(f"Resuming from last sync: {last_sync}")
-
     # Fetch articles
-    logging.info("Fetching articles from Wallabag...")
-    articles = wallabag.get_entries(since=last_sync)
-    logging.info(f"Found {len(articles)} articles to process")
+    if args.entries:
+        logging.info(f"Fetching {len(args.entries)} specific entries from Wallabag...")
+        articles = []
+        for entry_id in args.entries:
+            try:
+                article = wallabag.get_entry(entry_id)
+                articles.append(article)
+            except Exception as e:
+                logging.error(f"Failed to fetch entry {entry_id}: {e}")
+        logging.info(f"Retrieved {len(articles)} of {len(args.entries)} requested entries")
+    else:
+        last_sync = None
+        if not args.full and state_file.exists():
+            with open(state_file) as f:
+                state = json.load(f)
+                last_sync = state.get('last_sync')
+                logging.info(f"Resuming from last sync: {last_sync}")
+
+        logging.info("Fetching articles from Wallabag...")
+        articles = wallabag.get_entries(since=last_sync)
+        logging.info(f"Found {len(articles)} articles to process")
 
     if not articles:
         logging.info("No new articles to process")
@@ -118,8 +131,8 @@ def main():
         except Exception as e:
             logging.error(f"Failed to process article {article.get('id')}: {e}")
 
-    # Save state
-    if not args.dry_run:
+    # Save state (skip for targeted reprocessing)
+    if not args.dry_run and not args.entries:
         with open(state_file, 'w') as f:
             json.dump({'last_sync': datetime.now(timezone.utc).isoformat()}, f)
 
@@ -191,6 +204,15 @@ class WallabagClient:
             page += 1
 
         return all_entries
+
+    def get_entry(self, entry_id: int) -> dict:
+        """Fetch a single entry by ID"""
+        token = self._get_token()
+        headers = {'Authorization': f'Bearer {token}'}
+        resp = requests.get(f"{self.url}/api/entries/{entry_id}.json",
+                            headers=headers)
+        resp.raise_for_status()
+        return resp.json()
 
 
 def ensure_collection(client: QdrantClient, collection_name: str, dimensions: int = 1536):

@@ -42,6 +42,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='Papers/Documents to Qdrant Ingestion')
     parser.add_argument("--papers-dir", default=os.environ.get('PAPERS_DIR'), required=not os.environ.get('PAPERS_DIR'), help="Root directory containing papers/documents")
+    parser.add_argument("--collection", default=None, help="Qdrant collection name (overrides PAPERS_COLLECTION env var, default: 'papers')")
     parser.add_argument("-v", action="store_true", default=False, help="Print extra info")
     parser.add_argument("-vv", action="store_true", default=False, help="Print (more) extra info")
     parser.add_argument("--full", action="store_true", help="Full re-sync (ignore state)")
@@ -65,10 +66,16 @@ def main():
     chunk_size = int(os.environ.get('PAPERS_CHUNK_SIZE', os.environ.get('CHUNK_SIZE', 2000)))
     chunk_overlap = int(os.environ.get('PAPERS_CHUNK_OVERLAP', os.environ.get('CHUNK_OVERLAP', 400)))
     embedding_model = os.environ.get('EMBEDDING_MODEL', 'text-embedding-3-small')
-    collection_name = os.environ.get('PAPERS_COLLECTION', 'papers')
+    collection_name = args.collection or os.environ.get('PAPERS_COLLECTION', 'papers')
 
-    # State file location
-    state_file = config_dir / '.papers_sync_state.json'
+    # State file location (per-collection to allow independent sync tracking)
+    state_file = config_dir / f'.papers_sync_state_{collection_name}.json'
+
+    # Migrate legacy state file for the default 'papers' collection
+    legacy_state_file = config_dir / '.papers_sync_state.json'
+    if not state_file.exists() and legacy_state_file.exists() and collection_name == 'papers':
+        legacy_state_file.rename(state_file)
+        logging.info(f"Migrated legacy state file to {state_file.name}")
 
     # Initialize clients
     with warnings.catch_warnings():
