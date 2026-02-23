@@ -328,6 +328,7 @@ def process_article(article: dict, openai_client: OpenAI,
                 'reading_time': article.get('reading_time', 0),
                 'created_at': article.get('created_at', ''),
                 'tags': [t['label'] for t in article.get('tags', [])],
+                'published_by': article.get('published_by', []),
                 'source': 'wallabag'
             }
         ))
