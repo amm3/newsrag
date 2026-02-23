@@ -37,7 +37,10 @@ def main():
     parser.add_argument("--podcast-dir", default=os.environ.get('PODCAST_DIR'), required=not os.environ.get('PODCAST_DIR'), help="Root directory containing podcasts")
     parser.add_argument("-v", action="store_true", default=False, help="Print extra info")
     parser.add_argument("-vv", action="store_true", default=False, help="Print (more) extra info")
-    parser.add_argument("--full", action="store_true", help="Full re-sync (ignore state)")
+    sync_mode = parser.add_mutually_exclusive_group()
+    sync_mode.add_argument("--full", action="store_true", help="Full re-sync (ignore state)")
+    sync_mode.add_argument("--files", nargs='+', metavar='PATH',
+                           help="Reprocess specific transcript file paths")
     parser.add_argument("--dry-run", action="store_true", help="Don't write to Qdrant")
     args = parser.parse_args()
 
@@ -85,20 +88,35 @@ def main():
             processed_files = set(state.get('processed_files', []))
             logging.info(f"Loaded state: {len(processed_files)} files already processed")
 
-    # Find transcript files
     podcast_dir = Path(args.podcast_dir)
     if not podcast_dir.exists():
         log_fatal(f"Podcast directory does not exist: {podcast_dir}")
 
-    transcript_files = find_transcripts(podcast_dir)
-
-    # Filter to new files only (or all files if --full)
-    if args.full:
-        new_files = transcript_files
+    if args.files:
+        # Reprocess specific files by path
+        new_files = []
+        for fp in args.files:
+            tp = Path(fp).resolve()
+            if not tp.exists():
+                logging.error(f"File not found: {fp}")
+                continue
+            audio = find_audio_for(tp)
+            if audio is None:
+                logging.error(f"No audio counterpart for: {fp}")
+                continue
+            new_files.append((tp, audio))
+        logging.info(f"Reprocessing {len(new_files)} of {len(args.files)} requested files")
     else:
-        new_files = [(t, a) for t, a in transcript_files if str(t) not in processed_files]
+        # Discover transcript files
+        transcript_files = find_transcripts(podcast_dir)
 
-    logging.info(f"Found {len(transcript_files)} transcripts, {len(new_files)} to process")
+        # Filter to new files only (or all files if --full)
+        if args.full:
+            new_files = transcript_files
+        else:
+            new_files = [(t, a) for t, a in transcript_files if str(t) not in processed_files]
+
+        logging.info(f"Found {len(transcript_files)} transcripts, {len(new_files)} to process")
 
     if not new_files:
         logging.info("No new transcripts to process")
@@ -121,8 +139,8 @@ def main():
         except Exception as e:
             logging.error(f"Failed to process {transcript_path}: {e}")
 
-    # Save state
-    if not args.dry_run:
+    # Save state (skip for targeted reprocessing)
+    if not args.dry_run and not args.files:
         all_processed = processed_files | set(newly_processed)
         with open(state_file, 'w') as f:
             json.dump({
@@ -134,22 +152,27 @@ def main():
     return 0
 
 
+AUDIO_EXTENSIONS = ['.mp3', '.m4a', '.wav', '.ogg', '.flac']
+
+
+def find_audio_for(txt_path: Path) -> Path | None:
+    """Find the audio file corresponding to a transcript .txt file."""
+    for ext in AUDIO_EXTENSIONS:
+        candidate = txt_path.with_suffix(ext)
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def find_transcripts(root_dir: Path) -> list[tuple[Path, Path]]:
     """Find all .txt files that have corresponding audio files.
 
     Returns list of (transcript_path, audio_path) tuples.
     """
     transcripts = []
-    audio_extensions = ['.mp3', '.m4a', '.wav', '.ogg', '.flac']
 
     for txt_file in root_dir.rglob("*.txt"):
-        audio_file = None
-        for ext in audio_extensions:
-            candidate = txt_file.with_suffix(ext)
-            if candidate.exists():
-                audio_file = candidate
-                break
-
+        audio_file = find_audio_for(txt_file)
         if audio_file is not None:
             transcripts.append((txt_file, audio_file))
         else:
