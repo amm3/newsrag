@@ -13,7 +13,7 @@ import logging
 import hashlib
 import json
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -145,7 +145,7 @@ def main():
         with open(state_file, 'w') as f:
             json.dump({
                 'processed_files': list(all_processed),
-                'last_sync': datetime.utcnow().isoformat()
+                'last_sync': datetime.now(timezone.utc).isoformat()
             }, f, indent=2)
 
     logging.warning(f"Completed: {len(newly_processed)} files, {total_chunks} chunks indexed")
