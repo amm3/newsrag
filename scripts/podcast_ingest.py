@@ -82,12 +82,12 @@ def main():
         ensure_collection(qdrant, collection_name)
 
     # Load state
-    processed_files = set()
+    file_mtimes = {}
     if not args.full and state_file.exists():
         with open(state_file) as f:
             state = json.load(f)
-            processed_files = set(state.get('processed_files', []))
-            logging.info(f"Loaded state: {len(processed_files)} files already processed")
+            file_mtimes = state.get('file_mtimes', {})
+            logging.info(f"Loaded state: {len(file_mtimes)} files tracked")
 
     podcast_dir = Path(args.podcast_dir)
     if not podcast_dir.exists():
@@ -111,11 +111,11 @@ def main():
         # Discover transcript files
         transcript_files = find_transcripts(podcast_dir)
 
-        # Filter to new files only (or all files if --full)
+        # Filter to new/modified files only (or all files if --full)
         if args.full:
             new_files = transcript_files
         else:
-            new_files = [(t, a) for t, a in transcript_files if str(t) not in processed_files]
+            new_files = [(t, a) for t, a in transcript_files if int(t.stat().st_mtime) != file_mtimes.get(str(t))]
 
         logging.info(f"Found {len(transcript_files)} transcripts, {len(new_files)} to process")
 
@@ -142,10 +142,10 @@ def main():
 
     # Save state (skip for targeted reprocessing)
     if not args.dry_run and not args.files:
-        all_processed = processed_files | set(newly_processed)
+        file_mtimes.update({p: int(Path(p).stat().st_mtime) for p in newly_processed})
         with open(state_file, 'w') as f:
             json.dump({
-                'processed_files': list(all_processed),
+                'file_mtimes': file_mtimes,
                 'last_sync': datetime.now(timezone.utc).isoformat()
             }, f, indent=2)
 

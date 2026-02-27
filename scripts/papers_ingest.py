@@ -93,12 +93,12 @@ def main():
         ensure_collection(qdrant, collection_name)
 
     # Load state
-    processed_files = set()
+    file_mtimes = {}
     if not args.full and state_file.exists():
         with open(state_file) as f:
             state = json.load(f)
-            processed_files = set(state.get('processed_files', []))
-            logging.info(f"Loaded state: {len(processed_files)} files already processed")
+            file_mtimes = state.get('file_mtimes', {})
+            logging.info(f"Loaded state: {len(file_mtimes)} files tracked")
 
     # Find document files
     papers_dir = Path(args.papers_dir)
@@ -107,11 +107,11 @@ def main():
 
     document_files = find_documents(papers_dir)
 
-    # Filter to new files only (or all files if --full)
+    # Filter to new/modified files only (or all files if --full)
     if args.full:
         new_files = document_files
     else:
-        new_files = [f for f in document_files if str(f) not in processed_files]
+        new_files = [f for f in document_files if int(f.stat().st_mtime) != file_mtimes.get(str(f))]
 
     logging.info(f"Found {len(document_files)} documents, {len(new_files)} to process")
 
@@ -138,10 +138,10 @@ def main():
 
     # Save state
     if not args.dry_run:
-        all_processed = processed_files | set(newly_processed)
+        file_mtimes.update({p: int(Path(p).stat().st_mtime) for p in newly_processed})
         with open(state_file, 'w') as f:
             json.dump({
-                'processed_files': list(all_processed),
+                'file_mtimes': file_mtimes,
                 'last_sync': datetime.now(timezone.utc).isoformat()
             }, f, indent=2)
 
