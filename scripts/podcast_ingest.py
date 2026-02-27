@@ -8,6 +8,7 @@ generates embeddings, and upserts to Qdrant.
 
 import sys
 import os
+import re
 import argparse
 import logging
 import hashlib
@@ -199,6 +200,30 @@ def ensure_collection(client: QdrantClient, collection_name: str, dimensions: in
         logging.debug(f"Collection exists: {collection_name}")
 
 
+def parse_header(content: str) -> tuple[dict, str]:
+    """
+    Parse optional key: value metadata from the top of a file.
+    Parsing stops at the first blank line or non-matching line.
+    'tags' values are split by comma, lowercased, and whitespace-stripped.
+    Returns (metadata dict, remaining content with header stripped).
+    """
+    metadata = {}
+    lines = content.split('\n')
+    end = 0
+    for line in lines:
+        if not line.strip():
+            end += 1  # consume the blank separator line
+            break
+        m = re.match(r'^(\w[\w\s]*?)\s*:\s*(.+)$', line)
+        if not m:
+            break
+        key = m.group(1).strip().lower()
+        value = m.group(2).strip()
+        metadata[key] = [t.strip().lower() for t in value.split(',')] if key == 'tags' else value
+        end += 1
+    return metadata, '\n'.join(lines[end:])
+
+
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     """Split text into overlapping chunks"""
     if not text:
@@ -262,6 +287,9 @@ def process_transcript(transcript_path: Path, audio_path: Path, root_dir: Path,
         logging.debug(f"Skipping {transcript_path}: empty content")
         return 0
 
+    # Parse and strip metadata header
+    header_meta, content = parse_header(content)
+
     # Delete existing chunks for this file (for re-processing)
     if not dry_run:
         try:
@@ -295,21 +323,20 @@ def process_transcript(transcript_path: Path, audio_path: Path, root_dir: Path,
             chunk_idx = batch_start + i
             point_id = hashlib.md5(f"{file_id}_{chunk_idx}".encode()).hexdigest()
 
-            points.append(PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload={
-                    'file_id': file_id,
-                    'chunk_index': chunk_idx,
-                    'show_name': show_name,
-                    'episode_name': episode_name,
-                    'file_path': str(relative_path),
-                    'audio_file': str(audio_path.relative_to(root_dir)),
-                    'text': chunk,
-                    'modified_at': mtime,
-                    'source': 'podcast_transcript'
-                }
-            ))
+            payload = {
+                'file_id': file_id,
+                'chunk_index': chunk_idx,
+                'show_name': show_name,
+                'episode_name': episode_name,
+                'file_path': str(relative_path),
+                'audio_file': str(audio_path.relative_to(root_dir)),
+                'text': chunk,
+                'modified_at': mtime,
+                'source': 'podcast_transcript',
+            }
+            if 'tags' in header_meta:
+                payload['tags'] = header_meta['tags']
+            points.append(PointStruct(id=point_id, vector=embedding, payload=payload))
 
     # Upsert to Qdrant
     if not dry_run:

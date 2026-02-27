@@ -2,7 +2,7 @@
 OpenWebUI Tool: Qdrant Knowledge Search
 
 Search personal knowledge base (Wallabag articles, podcast transcripts, and
-papers) stored in Qdrant.
+document collections) stored in Qdrant.
 
 Installation:
 1. In OpenWebUI, go to Workspace → Tools → Create
@@ -12,15 +12,19 @@ Installation:
 
 Usage:
 The LLM can call search_knowledge(query, collection) to retrieve relevant
-context from your indexed articles, transcripts, and papers.
+context from your indexed articles, transcripts, and document collections.
 It can call get_full_article(article_id) to fetch full Wallabag article text,
-or get_full_document(file_path, source_type) to fetch full paper/podcast text
+or get_full_document(file_path, source_type) to fetch full document/podcast text
 from the static file server.
+
+Document collections beyond wallabag and podcasts are configurable via the
+DOCUMENT_COLLECTIONS Valve (comma-separated collection names) and
+DOCUMENT_COLLECTIONS_BASE_URL (files live under {base_url}/{collection_name}/).
 
 title: Qdrant Knowledge Search
 author: adam
-description: Search personal knowledge base (Wallabag articles, podcast transcripts, and papers)
-version: 1.0.0
+description: Search personal knowledge base (Wallabag articles, podcast transcripts, and document collections)
+version: 1.1.0
 """
 
 from typing import Callable
@@ -57,9 +61,13 @@ class Tools:
             default="podcast_transcripts",
             description="Qdrant collection name for podcast transcripts"
         )
-        PAPERS_COLLECTION: str = Field(
+        DOCUMENT_COLLECTIONS: str = Field(
             default="papers",
-            description="Qdrant collection name for papers/documents"
+            description="Comma-separated Qdrant collection names for document collections (e.g., 'papers,books,manuals')"
+        )
+        DOCUMENT_COLLECTIONS_BASE_URL: str = Field(
+            default="https://static-lan.maddock.net",
+            description="Base URL for document collections; files are at {base_url}/{collection_name}/..."
         )
         WALLABAG_URL: str = Field(
             default="",
@@ -81,10 +89,6 @@ class Tools:
             default="",
             description="Wallabag password"
         )
-        PAPERS_BASE_URL: str = Field(
-            default="https://static-lan.maddock.net/papers",
-            description="Base URL for papers on the static file server"
-        )
         PODCASTS_BASE_URL: str = Field(
             default="https://static-lan.maddock.net/podcasts",
             description="Base URL for podcast files on the static file server"
@@ -94,6 +98,23 @@ class Tools:
         self.valves = self.Valves()
         self._wallabag_token = None
         self._wallabag_token_expires = 0
+
+    def _get_document_collection_names(self) -> list[str]:
+        """Parse DOCUMENT_COLLECTIONS into a list of collection names."""
+        return [n.strip() for n in self.valves.DOCUMENT_COLLECTIONS.split(",") if n.strip()]
+
+    def _get_base_url_for_source(self, source: str) -> str:
+        """Build the base URL for a source type, with singular/plural fuzzy matching.
+
+        Documents live at {DOCUMENT_COLLECTIONS_BASE_URL}/{collection_name}/...
+        """
+        base = self.valves.DOCUMENT_COLLECTIONS_BASE_URL
+        if not base:
+            return ""
+        for coll in self._get_document_collection_names():
+            if source == coll or source == coll.rstrip("s") or source + "s" == coll:
+                return f"{base.rstrip('/')}/{coll}"
+        return ""
 
     def _get_wallabag_token(self) -> str:
         """Get or refresh Wallabag OAuth token"""
@@ -170,13 +191,16 @@ class Tools:
             article_url = article.get('url', '')
             reading_time = article.get('reading_time', 0)
             tags = [t['label'] for t in article.get('tags', [])]
-            
+            published_by = article.get('published_by', [])
+
             result = f"**{title}**\n"
             result += f"Source: {domain}\n"
             result += f"URL: {article_url}\n"
             result += f"Reading time: {reading_time} min\n"
             if tags:
                 result += f"Tags: {', '.join(tags)}\n"
+            if published_by:
+                result += f"Author: {', '.join(published_by)}\n"
             result += f"\n---\n\n{clean_content}"
             
             if __event_emitter__:
@@ -199,35 +223,42 @@ class Tools:
     async def get_full_document(
         self,
         file_path: str,
-        source_type: str = "paper",
+        source_type: str = "papers",
         __event_emitter__: Callable[[dict], None] = None,
     ) -> str:
         """
-        Fetch the full text content of a paper or podcast transcript from the
-        static file server.
+        Fetch the full text content of a document from the static file server.
 
         Use this after search_knowledge returns relevant snippets, when you need
         the complete document text for more detailed analysis or summarization.
 
         Args:
             file_path: The relative file path from search results payload
-                       (e.g., 'paper_name.md' or 'ShowName/Episode.txt')
-            source_type: Either 'paper' or 'podcast' to determine the base URL
+                       (e.g., 'paper_name.md' or 'ShowName/Episode.txt').
+                       Use the raw path with regular spaces, NOT a URL-encoded
+                       path (i.e., 'Show Name/Episode.txt' not 'Show%20Name/Episode.txt').
+            source_type: The collection name from search results (the 'Collection'
+                         field, e.g. 'papers', 'books'). For podcasts use 'podcasts'.
+                         The collection name is used as the folder name in the URL.
 
         Returns:
             The full document content with metadata header
         """
+        from urllib.parse import unquote
         import requests
 
-        if source_type == "paper":
-            base_url = self.valves.PAPERS_BASE_URL
-        elif source_type == "podcast":
+        # Normalize: decode any URL-encoded characters (e.g., %20 → space)
+        # so callers can pass either raw paths or URL-encoded paths.
+        file_path = unquote(file_path)
+
+        if source_type in ["podcast", "podcasts", "podcast_transcript"]:
             base_url = self.valves.PODCASTS_BASE_URL
         else:
-            return f"Error: Unknown source_type '{source_type}'. Use 'paper' or 'podcast'."
+            base_url = self._get_base_url_for_source(source_type)
 
         if not base_url:
-            return f"Error: Base URL not configured for {source_type}"
+            valid_types = ["podcasts"] + self._get_document_collection_names()
+            return f"Error: Unknown or unconfigured source_type '{source_type}'. Valid types: {', '.join(valid_types)}"
 
         full_url = self._build_static_url(base_url, file_path)
 
@@ -278,8 +309,11 @@ class Tools:
     @staticmethod
     def _build_static_url(base_url: str, relative_path: str) -> str:
         """Build a full URL from a base URL and a relative file path."""
-        from urllib.parse import quote
-        encoded_path = "/".join(quote(segment, safe="") for segment in relative_path.split("/"))
+        from urllib.parse import quote, unquote
+        # Decode first to handle already-encoded paths (e.g., %20 → space),
+        # then re-encode properly. This prevents double-encoding (%20 → %2520).
+        decoded_path = unquote(relative_path)
+        encoded_path = "/".join(quote(segment, safe="") for segment in decoded_path.split("/"))
         return f"{base_url.rstrip('/')}/{encoded_path}"
 
     @staticmethod
@@ -291,9 +325,9 @@ class Tools:
             return f"wallabag:{payload.get('article_id', payload.get('title', 'unknown'))}"
         elif source == "podcast_transcript":
             return f"podcast:{payload.get('show_name', '')}:{payload.get('episode_name', '')}"
-        elif source == "paper":
-            return f"paper:{payload.get('document_name', payload.get('file_path', 'unknown'))}"
-        return f"other:{payload.get('title', id(point))}"
+        else:
+            doc_id = payload.get('document_name', payload.get('file_path', payload.get('title', 'unknown')))
+            return f"{source}:{doc_id}"
 
     @staticmethod
     def _diversified_top_k(results: list, total_max: int, per_article_max: int) -> list:
@@ -345,7 +379,8 @@ class Tools:
             collection: Which collection to search:
                         - 'articles' for Wallabag saved articles only
                         - 'podcasts' for podcast transcripts only
-                        - 'papers' for papers/documents only
+                        - 'documents' for all document collections
+                        - a specific collection name (e.g. 'papers', 'books')
                         - 'all' for everything (default)
 
         Returns:
@@ -382,11 +417,17 @@ class Tools:
                 collections.append(self.valves.WALLABAG_COLLECTION)
             if collection in ["podcasts", "all"]:
                 collections.append(self.valves.PODCAST_COLLECTION)
-            if collection in ["papers", "all"]:
-                collections.append(self.valves.PAPERS_COLLECTION)
+
+            doc_names = self._get_document_collection_names()
+
+            if collection in ["documents", "all"]:
+                collections.extend(doc_names)
+            elif collection in doc_names:
+                collections.append(collection)
 
             if not collections:
-                return f"Unknown collection: {collection}. Use 'articles', 'podcasts', 'papers', or 'all'."
+                valid = ["articles", "podcasts", "documents", "all"] + doc_names
+                return f"Unknown collection: {collection}. Valid options: {', '.join(valid)}"
 
             all_results = []
 
@@ -399,6 +440,8 @@ class Tools:
                         query=query_vector,
                         limit=fetch_limit
                     )
+                    for point in results.points:
+                        point._collection_name = coll_name
                     all_results.extend(results.points)
                 except Exception as e:
                     if __event_emitter__:
@@ -431,6 +474,8 @@ class Tools:
                     )
                     if payload.get('tags'):
                         header += f"\nTags: {', '.join(payload['tags'])}"
+                    if payload.get('published_by'):
+                        header += f"\nAuthor: {', '.join(payload['published_by'])}"
                 elif source == "podcast_transcript":
                     header = (
                         f"**Podcast: {payload.get('show_name', 'Unknown Show')}**\n"
@@ -443,17 +488,29 @@ class Tools:
                         audio_file = payload.get('audio_file', '')
                         if audio_file:
                             header += f"\nAudio: {self._build_static_url(self.valves.PODCASTS_BASE_URL, audio_file)}"
-                elif source == "paper":
-                    header = (
-                        f"**Paper: {payload.get('document_name', 'Unknown Document')}**\n"
-                        f"File: {payload.get('file_path', 'N/A')}"
-                    )
-                    if self.valves.PAPERS_BASE_URL:
-                        link_path = payload.get('original_file') or payload.get('file_path', '')
-                        if link_path:
-                            header += f"\nURL: {self._build_static_url(self.valves.PAPERS_BASE_URL, link_path)}"
+                    if payload.get('tags'):
+                        header += f"\nTags: {', '.join(payload['tags'])}"
                 else:
-                    header = f"**Source: {source}**"
+                    collection_name = getattr(r, '_collection_name', source)
+                    doc_name = payload.get('document_name', payload.get('title', 'Unknown Document'))
+                    header = (
+                        f"**Document: {doc_name}**\n"
+                        f"Collection: {collection_name}"
+                    )
+                    file_path = payload.get('file_path', '')
+                    if file_path:
+                        header += f"\nFile: {file_path}"
+                    base_url = self._get_base_url_for_source(collection_name)
+                    if base_url:
+                        link_path = payload.get('original_file') or file_path
+                        if link_path:
+                            header += f"\nURL: {self._build_static_url(base_url, link_path)}"
+                    for key in ['author', 'date', 'category', 'tags']:
+                        if key in payload:
+                            val = payload[key]
+                            if isinstance(val, list):
+                                val = ', '.join(str(v) for v in val)
+                            header += f"\n{key.title()}: {val}"
 
                 text = payload.get('text', '')
                 context_parts.append(f"{header}\n\n{text}\n\n---")
