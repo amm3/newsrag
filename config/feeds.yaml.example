@@ -1,0 +1,51 @@
+# feeds.yaml - RSS/Atom feed configuration
+# Copy to feeds.yaml and fill in your values.
+#
+# Usage: ./run.sh feeds -v
+
+# =============================================================================
+# Firecrawl Configuration (optional)
+# =============================================================================
+# URL of your self-hosted Firecrawl instance.
+# When set, articles without full content in the feed will be fetched via
+# Firecrawl, which handles JavaScript rendering and returns clean markdown.
+# If not set, trafilatura is used as a fallback for direct HTTP fetching.
+firecrawl_url: http://firecrawl.local:3002
+
+# Request timeout in seconds for Firecrawl and direct HTTP fetches.
+firecrawl_timeout: 30
+
+# =============================================================================
+# Culling
+# =============================================================================
+# Delete articles older than this many days on each sync run.
+# Set to 0 (default) to disable culling.
+# Note: only articles ingested after this setting was added carry a timestamp;
+# run with --full once to stamp existing articles and make them eligible.
+max_age_days: 90
+
+# =============================================================================
+# Feed List
+# =============================================================================
+# Each feed requires a 'url'. The 'name' is used in Qdrant payloads.
+#
+# Per-feed options:
+#   fetch_content: true   (default) Fetch full article if feed content is short
+#   fetch_content: false  Use only whatever the feed provides; never fetch page
+
+feeds:
+  - url: https://example.com/feed.rss
+    name: Example Blog
+
+  - url: https://news.ycombinator.com/rss
+    name: Hacker News
+    # HN only provides titles/links in the feed; full content fetch is useful
+    fetch_content: true
+
+  - url: https://www.theverge.com/rss/index.xml
+    name: The Verge
+
+  - url: https://feeds.arstechnica.com/arstechnica/index
+    name: Ars Technica
+    # Ars provides full article text in the feed
+    fetch_content: false

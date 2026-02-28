@@ -2,7 +2,7 @@
 OpenWebUI Tool: Qdrant Knowledge Search
 
 Search personal knowledge base (Wallabag articles, podcast transcripts, document
-collections, and RSS/Atom news feeds) stored in Qdrant.
+collections, RSS/Atom news feeds, and Kindle book highlights) stored in Qdrant.
 
 Installation:
 1. In OpenWebUI, go to Workspace → Tools → Create
@@ -23,8 +23,8 @@ DOCUMENT_COLLECTIONS_BASE_URL (files live under {base_url}/{collection_name}/).
 
 title: Qdrant Knowledge Search
 author: adam
-description: Search personal knowledge base (Wallabag articles, podcast transcripts, and document collections)
-version: 1.2.0
+description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, and Kindle highlights)
+version: 1.3.0
 """
 
 from typing import Callable
@@ -64,6 +64,10 @@ class Tools:
         FEEDS_COLLECTION: str = Field(
             default="news_feeds",
             description="Qdrant collection name for RSS/Atom feed articles"
+        )
+        KINDLE_COLLECTION: str = Field(
+            default="kindle_highlights",
+            description="Qdrant collection name for Kindle book highlights"
         )
         DOCUMENT_COLLECTIONS: str = Field(
             default="papers",
@@ -331,6 +335,8 @@ class Tools:
             return f"podcast:{payload.get('show_name', '')}:{payload.get('episode_name', '')}"
         elif source == "feed":
             return f"feed:{payload.get('entry_id', payload.get('title', 'unknown'))}"
+        elif source == "kindle":
+            return f"kindle:{payload.get('asin', payload.get('book_title', 'unknown'))}"
         else:
             doc_id = payload.get('document_name', payload.get('file_path', payload.get('title', 'unknown')))
             return f"{source}:{doc_id}"
@@ -386,6 +392,7 @@ class Tools:
                         - 'articles' for Wallabag saved articles only
                         - 'podcasts' for podcast transcripts only
                         - 'feeds' for RSS/Atom news feed articles only
+                        - 'kindle' for Kindle book highlights only
                         - 'documents' for all document collections
                         - a specific collection name (e.g. 'papers', 'books')
                         - 'all' for everything (default)
@@ -426,6 +433,8 @@ class Tools:
                 collections.append(self.valves.PODCAST_COLLECTION)
             if collection in ["feeds", "all"]:
                 collections.append(self.valves.FEEDS_COLLECTION)
+            if collection in ["kindle", "all"]:
+                collections.append(self.valves.KINDLE_COLLECTION)
 
             doc_names = self._get_document_collection_names()
 
@@ -435,7 +444,7 @@ class Tools:
                 collections.append(collection)
 
             if not collections:
-                valid = ["articles", "podcasts", "feeds", "documents", "all"] + doc_names
+                valid = ["articles", "podcasts", "feeds", "kindle", "documents", "all"] + doc_names
                 return f"Unknown collection: {collection}. Valid options: {', '.join(valid)}"
 
             all_results = []
@@ -511,6 +520,14 @@ class Tools:
                         header += f"\nAuthor: {payload['author']}"
                     if payload.get('tags'):
                         header += f"\nTags: {', '.join(payload['tags'])}"
+                elif source == "kindle":
+                    header = (
+                        f"**Kindle: {payload.get('book_title', 'Unknown Book')}**\n"
+                        f"Author: {payload.get('authors', 'Unknown')}\n"
+                        f"Location: {payload.get('location_value', 'N/A')}"
+                    )
+                    if payload.get('location_url'):
+                        header += f"\nKindle Link: {payload['location_url']}"
                 else:
                     collection_name = getattr(r, '_collection_name', source)
                     doc_name = payload.get('document_name', payload.get('title', 'Unknown Document'))
@@ -532,6 +549,9 @@ class Tools:
                             if isinstance(val, list):
                                 val = ', '.join(str(v) for v in val)
                             header += f"\n{key.title()}: {val}"
+
+                if payload.get('published_at') and '\nPublished:' not in header:
+                    header += f"\nPublished: {payload['published_at']}"
 
                 text = payload.get('text', '')
                 context_parts.append(f"{header}\n\n{text}\n\n---")

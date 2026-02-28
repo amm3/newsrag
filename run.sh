@@ -49,6 +49,7 @@ Commands:
   wallabag    Ingest articles from Wallabag
   podcasts    Ingest podcast transcripts from filesystem
   papers      Ingest papers/documents from filesystem
+  kindle      Ingest Kindle highlights from Bookcision JSON exports
   help        Show this help message
 
 Wallabag Options:
@@ -81,6 +82,14 @@ Feeds Options:
   -v                     Verbose output
   -vv                    Debug output
 
+Kindle Options:
+  --kindle-dir PATH    Directory containing Bookcision JSON files (required)
+  --files PATH [...]   Reprocess specific JSON file paths
+  --full               Full re-sync (ignore state file)
+  --dry-run            Don't write to Qdrant
+  -v                   Verbose output
+  -vv                  Debug output
+
 Examples:
   ./run.sh wallabag -v
   ./run.sh wallabag --entries 1234 5678 -v
@@ -93,6 +102,8 @@ Examples:
   ./run.sh feeds -v
   ./run.sh feeds --full --dry-run -v
   ./run.sh feeds --feeds https://example.com/feed.rss -v
+  ./run.sh kindle --kindle-dir /path/to/exports -v
+  ./run.sh kindle --kindle-dir /path/to/exports --full -v
 
 State files are stored in $CONFIG_DIR/
 Delete them to force a full re-sync.
@@ -115,6 +126,10 @@ case "${1:-help}" in
     feeds|feed)
         shift
         exec python "$SCRIPT_DIR/scripts/feeds_ingest.py" "$@"
+        ;;
+    kindle)
+        shift
+        exec python "$SCRIPT_DIR/scripts/kindle_ingest.py" "$@"
         ;;
     help|--help|-h)
         show_help
