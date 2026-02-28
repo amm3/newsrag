@@ -1,6 +1,6 @@
 # Qdrant RAG Loader
 
-A personal RAG system for indexing Wallabag articles and podcast transcripts into Qdrant, queryable via OpenWebUI.
+A personal RAG system for indexing Wallabag articles, podcast transcripts, research papers, RSS/Atom news feeds, and Kindle book highlights into Qdrant, queryable via OpenWebUI.
 
 ---
 
@@ -22,31 +22,33 @@ A personal RAG system for indexing Wallabag articles and podcast transcripts int
 ## Architecture Overview
 
 ```
-┌─────────────────┐     ┌─────────────────┐
-│   Wallabag      │     │  NAS (Podcasts) │
-│   (API)         │     │  /path/to/txts  │
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         ▼                       ▼
-┌─────────────────────────────────────────┐
-│         Ingestion Scripts               │
-│  (Python venv on server)                 │
-└────────────────┬────────────────────────┘
-                 │
-                 ▼
-         ┌───────────────┐
-         │    OpenAI     │
-         │  Embeddings   │
-         │  API          │
-         └───────┬───────┘
-                 │
-                 ▼
-         ┌───────────────┐
-         │    Qdrant     │
-         │  (server)     │
-         └───────┬───────┘
-                 │
-                 ▼
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│  Wallabag   │  │ NAS (Pods)  │  │   Papers/   │  │  RSS/Atom   │  │   Kindle    │
+│   (API)     │  │ /path/txts  │  │   Docs      │  │   Feeds     │  │  Highlights │
+└──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
+       │                │                │                │                │
+       └────────────────┴────────────────┴────────────────┴────────────────┘
+                                         │
+                                         ▼
+                        ┌────────────────────────────────┐
+                        │       Ingestion Scripts        │
+                        │    (Python venv on server)     │
+                        └───────────────┬────────────────┘
+                                        │
+                                        ▼
+                                ┌───────────────┐
+                                │    OpenAI     │
+                                │  Embeddings   │
+                                │     API       │
+                                └───────┬───────┘
+                                        │
+                                        ▼
+                                ┌───────────────┐
+                                │    Qdrant     │
+                                │   (server)    │
+                                └───────┬───────┘
+                                        │
+                                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                        OpenWebUI                            │
 ├─────────────────────────────────────────────────────────────┤
@@ -55,7 +57,9 @@ A personal RAG system for indexing Wallabag articles and podcast transcripts int
 │  • Knowledge bases you create │  ─────────────────────────  │
 │  • Folder uploads             │  • Wallabag articles        │
 │  • Ad-hoc file attachments    │  • Podcast transcripts      │
-│  • Unchanged, works as normal │  • Future data sources      │
+│  • Unchanged, works as normal │  • Papers/documents         │
+│                               │  • RSS/Atom feed articles   │
+│                               │  • Kindle book highlights   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -63,7 +67,7 @@ A personal RAG system for indexing Wallabag articles and podcast transcripts int
 - **Qdrant on dedicated server** - GPU proximity for future local embedding experiments
 - **Storage on NVMe** - Low latency for vector operations
 - **OpenAI `text-embedding-3-small`** - Best cost/quality ratio at $0.02/1M tokens
-- **Separate collections** - `wallabag_articles` and `podcast_transcripts`
+- **Separate collections** - `wallabag_articles`, `podcast_transcripts`, `papers`, `news_feeds`, `kindle_highlights`
 - **OpenWebUI unchanged** - Qdrant accessed via custom Tool, not replacing ChromaDB
 
 ---
@@ -78,7 +82,7 @@ On the server:
 - Docker and Docker Compose
 - Python 3.10+
 - Network access to your Wallabag instance
-- NFS/SMB mount to NAS podcast directory
+- NFS/SMB mount to NAS podcast directory (for podcast ingestion)
 
 ---
 
@@ -132,6 +136,16 @@ Generate a secure key:
 ```bash
 openssl rand -base64 32
 ```
+
+### RSS/Atom Feeds
+
+Copy the example feed config and edit:
+
+```bash
+cp config/feeds.yaml.example config/feeds.yaml
+```
+
+See [config/feeds.yaml.example](config/feeds.yaml.example) for the feed list format.
 
 ---
 
@@ -195,13 +209,68 @@ Use the `run.sh` wrapper script, which activates the venv automatically:
 ./run.sh podcasts --podcast-dir /path/to/podcasts -v
 ```
 
+### Papers / Documents
+
+```bash
+# Dry run
+./run.sh papers --dry-run -v
+
+# Full sync
+./run.sh papers --full -v
+
+# Incremental sync
+./run.sh papers -v
+
+# Reprocess specific files
+./run.sh papers --files /path/to/doc.pdf /path/to/other.txt -v
+```
+
+### RSS/Atom News Feeds
+
+Requires `config/feeds.yaml` (see [Configuration](#configuration)).
+
+```bash
+# Dry run
+./run.sh feeds --dry-run -v
+
+# Full sync
+./run.sh feeds --full -v
+
+# Incremental sync
+./run.sh feeds -v
+
+# Ingest a specific feed URL
+./run.sh feeds --feeds https://example.com/feed.rss -v
+```
+
+### Kindle Highlights
+
+Expects [Bookcision](https://readwise.io/bookcision) JSON export files.
+
+```bash
+# Dry run
+./run.sh kindle --kindle-dir /path/to/exports --dry-run -v
+
+# Full sync
+./run.sh kindle --kindle-dir /path/to/exports --full -v
+
+# Incremental sync
+./run.sh kindle --kindle-dir /path/to/exports -v
+
+# Reprocess specific files
+./run.sh kindle --kindle-dir /path/to/exports --files book1.json book2.json -v
+```
+
 ### State Files
 
-Incremental sync state is stored in:
-- `config/.wallabag_sync_state.json`
-- `config/.podcast_sync_state.json`
+Incremental sync state is stored in `config/`:
+- `.wallabag_sync_state.json`
+- `.podcast_sync_state.json`
+- `.papers_sync_state.json`
+- `.feeds_sync_state.json`
+- `.kindle_sync_state.json`
 
-Delete these files to force a full re-sync.
+Delete a state file to force a full re-sync for that source.
 
 ---
 
@@ -215,20 +284,31 @@ Configure the Tool's Valves (settings):
 - `QDRANT_URL`: `http://your-server:6333`
 - `QDRANT_API_KEY`: Your Qdrant API key
 - `OPENAI_API_KEY`: Your OpenAI API key
-- `TOP_K`: Number of results (default: 5)
+- `TOP_K`: Number of results per collection (default: 5)
+- `WALLABAG_COLLECTION`: Qdrant collection name (default: `wallabag_articles`)
+- `PODCAST_COLLECTION`: Qdrant collection name (default: `podcast_transcripts`)
+- `FEEDS_COLLECTION`: Qdrant collection name (default: `news_feeds`)
+- `KINDLE_COLLECTION`: Qdrant collection name (default: `kindle_highlights`)
+- `DOCUMENT_COLLECTIONS`: Comma-separated collection names for document sources (default: `papers`)
 
 ### System Prompt Enhancement
 
 For models that should automatically use your knowledge base, add to the system prompt:
 
 ```
-You have access to a personal knowledge base via the search_knowledge tool. 
-When the user asks questions that might benefit from personal context 
-(saved articles, podcast transcripts), use search_knowledge first.
+You have access to a personal knowledge base via the search_knowledge tool.
+When the user asks questions that might benefit from personal context, use
+search_knowledge first.
 
 Sources include:
-- Saved news articles from Wallabag
+- Saved articles from Wallabag
 - Podcast transcripts
+- Research papers and documents
+- RSS/Atom news feed articles
+- Kindle book highlights
+
+The 'collection' parameter lets you target a specific source: 'articles',
+'podcasts', 'feeds', 'kindle', 'documents', or 'all' (default).
 
 Always cite which source you're drawing from when using retrieved information.
 ```
@@ -243,7 +323,10 @@ Always cite which source you're drawing from when using retrieved information.
 # /etc/cron.d/qdrant-ingest
 0 3 * * * youruser /path/to/qdrant_loader/run.sh wallabag -v >> /var/log/qdrant-ingest.log 2>&1
 15 3 * * * youruser /path/to/qdrant_loader/run.sh podcasts --podcast-dir /path/to/podcasts -v >> /var/log/qdrant-ingest.log 2>&1
+30 3 * * * youruser /path/to/qdrant_loader/run.sh feeds -v >> /var/log/qdrant-ingest.log 2>&1
 ```
+
+Papers and Kindle highlights are typically ingested on-demand rather than on a schedule.
 
 ---
 
@@ -275,7 +358,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv('config/.env')
 client = QdrantClient(url=os.environ['QDRANT_URL'], api_key=os.environ.get('QDRANT_API_KEY'))
-client.delete_collection('wallabag_articles')  # or 'podcast_transcripts'
+client.delete_collection('wallabag_articles')  # or any other collection name
 print('Collection deleted')
 "
 ```
@@ -366,10 +449,15 @@ qdrant_loader/
 ├── requirements.txt          # Python dependencies
 ├── config/
 │   ├── .env.example          # Template configuration
-│   └── .env                  # Your configuration (git-ignored)
+│   ├── .env                  # Your configuration (git-ignored)
+│   ├── feeds.yaml.example    # Template feed list
+│   └── feeds.yaml            # Your feed list (git-ignored)
 └── scripts/
-    ├── wallabag_ingest.py    # Wallabag ingestion
+    ├── wallabag_ingest.py    # Wallabag article ingestion
     ├── podcast_ingest.py     # Podcast transcript ingestion
+    ├── papers_ingest.py      # Papers/document ingestion
+    ├── feeds_ingest.py       # RSS/Atom feed ingestion
+    ├── kindle_ingest.py      # Kindle highlights ingestion
     └── openwebui_tool.py     # OpenWebUI Tool code
 ```
 
@@ -377,8 +465,8 @@ qdrant_loader/
 
 ## Cost Estimate
 
-With ~200 Wallabag articles and typical podcast transcripts:
-- **Initial indexing**: $0.10 - $0.50
+With typical usage across all sources:
+- **Initial indexing**: $0.10 - $1.00 (depending on corpus size)
 - **Incremental updates**: Negligible (pennies/month)
 
 OpenAI `text-embedding-3-small` pricing: $0.02 per 1M tokens
