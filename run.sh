@@ -8,6 +8,7 @@
 #   ./run.sh wallabag [options]      - Run Wallabag ingestion
 #   ./run.sh podcasts [options]      - Run podcast transcript ingestion
 #   ./run.sh papers [options]        - Run papers/documents ingestion
+#   ./run.sh feeds [options]         - Run RSS/Atom feed ingestion
 #   ./run.sh help                    - Show this help
 #
 
@@ -72,6 +73,14 @@ Papers Options:
   -v                   Verbose output
   -vv                  Debug output
 
+Feeds Options:
+  --feeds URL [URL ...]  Reprocess specific feed URLs only
+  --config PATH          Path to feeds YAML config (default: config/feeds.yaml)
+  --full                 Full re-sync (ignore state file)
+  --dry-run              Don't write to Qdrant
+  -v                     Verbose output
+  -vv                    Debug output
+
 Examples:
   ./run.sh wallabag -v
   ./run.sh wallabag --entries 1234 5678 -v
@@ -81,6 +90,9 @@ Examples:
   ./run.sh papers --papers-dir /mnt/nas/papers -v
   ./run.sh papers --papers-dir /mnt/nas/papers --collection my-papers -v
   ./run.sh papers --papers-dir /mnt/nas/papers --full -v
+  ./run.sh feeds -v
+  ./run.sh feeds --full --dry-run -v
+  ./run.sh feeds --feeds https://example.com/feed.rss -v
 
 State files are stored in $CONFIG_DIR/
 Delete them to force a full re-sync.
@@ -99,6 +111,10 @@ case "${1:-help}" in
     papers|paper)
         shift
         exec python "$SCRIPT_DIR/scripts/papers_ingest.py" "$@"
+        ;;
+    feeds|feed)
+        shift
+        exec python "$SCRIPT_DIR/scripts/feeds_ingest.py" "$@"
         ;;
     help|--help|-h)
         show_help

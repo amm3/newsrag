@@ -1,8 +1,8 @@
 """
 OpenWebUI Tool: Qdrant Knowledge Search
 
-Search personal knowledge base (Wallabag articles, podcast transcripts, and
-document collections) stored in Qdrant.
+Search personal knowledge base (Wallabag articles, podcast transcripts, document
+collections, and RSS/Atom news feeds) stored in Qdrant.
 
 Installation:
 1. In OpenWebUI, go to Workspace → Tools → Create
@@ -12,7 +12,7 @@ Installation:
 
 Usage:
 The LLM can call search_knowledge(query, collection) to retrieve relevant
-context from your indexed articles, transcripts, and document collections.
+context from your indexed articles, transcripts, document collections, and feeds.
 It can call get_full_article(article_id) to fetch full Wallabag article text,
 or get_full_document(file_path, source_type) to fetch full document/podcast text
 from the static file server.
@@ -24,7 +24,7 @@ DOCUMENT_COLLECTIONS_BASE_URL (files live under {base_url}/{collection_name}/).
 title: Qdrant Knowledge Search
 author: adam
 description: Search personal knowledge base (Wallabag articles, podcast transcripts, and document collections)
-version: 1.1.0
+version: 1.2.0
 """
 
 from typing import Callable
@@ -60,6 +60,10 @@ class Tools:
         PODCAST_COLLECTION: str = Field(
             default="podcast_transcripts",
             description="Qdrant collection name for podcast transcripts"
+        )
+        FEEDS_COLLECTION: str = Field(
+            default="news_feeds",
+            description="Qdrant collection name for RSS/Atom feed articles"
         )
         DOCUMENT_COLLECTIONS: str = Field(
             default="papers",
@@ -325,6 +329,8 @@ class Tools:
             return f"wallabag:{payload.get('article_id', payload.get('title', 'unknown'))}"
         elif source == "podcast_transcript":
             return f"podcast:{payload.get('show_name', '')}:{payload.get('episode_name', '')}"
+        elif source == "feed":
+            return f"feed:{payload.get('entry_id', payload.get('title', 'unknown'))}"
         else:
             doc_id = payload.get('document_name', payload.get('file_path', payload.get('title', 'unknown')))
             return f"{source}:{doc_id}"
@@ -379,6 +385,7 @@ class Tools:
             collection: Which collection to search:
                         - 'articles' for Wallabag saved articles only
                         - 'podcasts' for podcast transcripts only
+                        - 'feeds' for RSS/Atom news feed articles only
                         - 'documents' for all document collections
                         - a specific collection name (e.g. 'papers', 'books')
                         - 'all' for everything (default)
@@ -417,6 +424,8 @@ class Tools:
                 collections.append(self.valves.WALLABAG_COLLECTION)
             if collection in ["podcasts", "all"]:
                 collections.append(self.valves.PODCAST_COLLECTION)
+            if collection in ["feeds", "all"]:
+                collections.append(self.valves.FEEDS_COLLECTION)
 
             doc_names = self._get_document_collection_names()
 
@@ -426,7 +435,7 @@ class Tools:
                 collections.append(collection)
 
             if not collections:
-                valid = ["articles", "podcasts", "documents", "all"] + doc_names
+                valid = ["articles", "podcasts", "feeds", "documents", "all"] + doc_names
                 return f"Unknown collection: {collection}. Valid options: {', '.join(valid)}"
 
             all_results = []
@@ -488,6 +497,18 @@ class Tools:
                         audio_file = payload.get('audio_file', '')
                         if audio_file:
                             header += f"\nAudio: {self._build_static_url(self.valves.PODCASTS_BASE_URL, audio_file)}"
+                    if payload.get('tags'):
+                        header += f"\nTags: {', '.join(payload['tags'])}"
+                elif source == "feed":
+                    header = (
+                        f"**Feed Article: {payload.get('title', 'Untitled')}**\n"
+                        f"Feed: {payload.get('feed_name', payload.get('feed_url', 'Unknown Feed'))}\n"
+                        f"URL: {payload.get('url', 'N/A')}"
+                    )
+                    if payload.get('published'):
+                        header += f"\nPublished: {payload['published']}"
+                    if payload.get('author'):
+                        header += f"\nAuthor: {payload['author']}"
                     if payload.get('tags'):
                         header += f"\nTags: {', '.join(payload['tags'])}"
                 else:
