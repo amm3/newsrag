@@ -14,6 +14,7 @@ import logging
 import hashlib
 import json
 import re
+import socket
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +25,9 @@ import yaml
 import trafilatura
 from dotenv import load_dotenv
 from openai import OpenAI
-from qdrant_client import QdrantClient
+
+from alert import send_alert
+from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
     Filter, FieldCondition, MatchValue, Range, PayloadSchemaType
@@ -76,6 +79,7 @@ def main():
         feeds_config = yaml.safe_load(f)
 
     max_age_days = int(feeds_config.get('max_age_days', 0))
+    min_retention_count = int(feeds_config.get('min_retention_count', 20))
 
     all_feeds = feeds_config.get('feeds', [])
     if not all_feeds:
@@ -202,7 +206,8 @@ def main():
     logging.warning(f"Completed: {total_entries} new entries, {total_chunks} chunks indexed")
 
     if max_age_days > 0:
-        cull_old_entries(qdrant, collection_name, max_age_days, args.dry_run)
+        feed_urls = [f['url'] for f in all_feeds]
+        cull_old_entries(qdrant, collection_name, max_age_days, min_retention_count, feed_urls, args.dry_run)
 
     return 0
 
@@ -406,29 +411,69 @@ def ensure_collection(client: QdrantClient, collection_name: str, dimensions: in
         logging.info(f"Created collection: {collection_name}")
     else:
         logging.debug(f"Collection exists: {collection_name}")
-    # Payload index for efficient age-based culling
-    try:
-        client.create_payload_index(
-            collection_name=collection_name,
-            field_name='published_ts',
-            field_schema=PayloadSchemaType.FLOAT
-        )
-        logging.debug("Ensured payload index on published_ts")
-    except Exception as e:
-        logging.debug(f"Payload index on published_ts already exists or failed: {e}")
+    # Payload indexes for efficient culling
+    for field_name, schema in [('published_ts', PayloadSchemaType.FLOAT), ('feed_url', PayloadSchemaType.KEYWORD)]:
+        try:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=schema
+            )
+            logging.debug(f"Ensured payload index on {field_name}")
+        except Exception as e:
+            logging.debug(f"Payload index on {field_name} already exists or failed: {e}")
 
 
-def cull_old_entries(qdrant: QdrantClient, collection_name: str, max_age_days: int, dry_run: bool = False):
-    """Delete points older than max_age_days. Only affects points with published_ts set."""
+def cull_old_entries(qdrant: QdrantClient, collection_name: str, max_age_days: int,
+                     min_retention_count: int, feed_urls: list[str], dry_run: bool = False):
+    """Delete points older than max_age_days per feed, but always keep at least
+    min_retention_count of the most-recent articles per feed regardless of age."""
     cutoff = datetime.now(timezone.utc).timestamp() - (max_age_days * 86400)
-    old_filter = Filter(must=[FieldCondition(key='published_ts', range=Range(lt=cutoff))])
-    count = qdrant.count(collection_name=collection_name, count_filter=old_filter).count
-    if count == 0:
-        logging.info(f"Cull: no chunks older than {max_age_days} days")
-        return
-    logging.warning(f"Culling {count} chunks older than {max_age_days} days")
-    if not dry_run:
-        qdrant.delete(collection_name=collection_name, points_selector=old_filter)
+    total_culled = 0
+
+    for feed_url in feed_urls:
+        feed_filter = Filter(must=[FieldCondition(key='feed_url', match=MatchValue(value=feed_url))])
+
+        total = qdrant.count(collection_name=collection_name, count_filter=feed_filter).count
+        if total <= min_retention_count:
+            logging.info(f"Cull [{feed_url}]: only {total} articles, below min_retention_count={min_retention_count}, skipping")
+            continue
+
+        # Find the published_ts of the Nth most-recent article to establish the protection floor.
+        # Scroll min_retention_count points ordered by published_ts DESC; the last one is T_protect.
+        protected, _ = qdrant.scroll(
+            collection_name=collection_name,
+            scroll_filter=feed_filter,
+            with_payload=['published_ts'],
+            with_vectors=False,
+            limit=min_retention_count,
+            order_by=models.OrderBy(key='published_ts', direction=models.Direction.DESC),
+        )
+        if not protected:
+            continue
+        t_protect = protected[-1].payload.get('published_ts', 0)
+
+        # effective_cutoff: only delete articles that are both beyond the protection floor
+        # AND older than max_age_days. If the feed is low-volume and the Nth article is already
+        # older than max_age_days, effective_cutoff = t_protect (keeps top N, drops older tail).
+        effective_cutoff = min(cutoff, t_protect)
+
+        delete_filter = Filter(must=[
+            FieldCondition(key='feed_url', match=MatchValue(value=feed_url)),
+            FieldCondition(key='published_ts', range=Range(lt=effective_cutoff)),
+        ])
+        count = qdrant.count(collection_name=collection_name, count_filter=delete_filter).count
+        if count == 0:
+            logging.info(f"Cull [{feed_url}]: nothing to delete")
+            continue
+
+        logging.warning(f"Culling {count} chunks for {feed_url} (effective_cutoff={effective_cutoff:.0f}, protect top {min_retention_count})")
+        if not dry_run:
+            qdrant.delete(collection_name=collection_name, points_selector=delete_filter)
+        total_culled += count
+
+    if total_culled:
+        logging.warning(f"Cull complete: {total_culled} total chunks removed")
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -461,6 +506,10 @@ def get_embeddings(texts: list[str], client: OpenAI, model: str) -> list[list[fl
 
 def log_fatal(msg, exit_code=-1):
     logging.critical(f"Fatal Err: {msg}")
+    send_alert(
+        subject=f"[ALERT] feeds_ingest failed on {socket.gethostname()}",
+        body=msg
+    )
     sys.exit(exit_code)
 
 

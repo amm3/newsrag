@@ -50,6 +50,7 @@ Commands:
   podcasts    Ingest podcast transcripts from filesystem
   papers      Ingest papers/documents from filesystem
   kindle      Ingest Kindle highlights from Bookcision JSON exports
+  openwebui   Ingest chat history from OpenWebUI
   help        Show this help message
 
 Wallabag Options:
@@ -90,6 +91,13 @@ Kindle Options:
   -v                   Verbose output
   -vv                  Debug output
 
+OpenWebUI Options:
+  --chats UUID [UUID ...]  Reprocess specific chat UUIDs only
+  --full                   Full re-sync (ignore state file)
+  --dry-run                Don't write to Qdrant
+  -v                       Verbose output
+  -vv                      Debug output
+
 Examples:
   ./run.sh wallabag -v
   ./run.sh wallabag --entries 1234 5678 -v
@@ -104,6 +112,9 @@ Examples:
   ./run.sh feeds --feeds https://example.com/feed.rss -v
   ./run.sh kindle --kindle-dir /path/to/exports -v
   ./run.sh kindle --kindle-dir /path/to/exports --full -v
+  ./run.sh openwebui -v
+  ./run.sh openwebui --full --dry-run -v
+  ./run.sh openwebui --chats abc123 def456 -v
 
 State files are stored in $CONFIG_DIR/
 Delete them to force a full re-sync.
@@ -130,6 +141,10 @@ case "${1:-help}" in
     kindle)
         shift
         exec python "$SCRIPT_DIR/scripts/kindle_ingest.py" "$@"
+        ;;
+    openwebui|owui)
+        shift
+        exec python "$SCRIPT_DIR/scripts/openwebui_chat_loader.py" "$@"
         ;;
     help|--help|-h)
         show_help

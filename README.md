@@ -261,6 +261,38 @@ Expects [Bookcision](https://readwise.io/bookcision) JSON export files.
 ./run.sh kindle --kindle-dir /path/to/exports --files book1.json book2.json -v
 ```
 
+### OpenWebUI Chats
+
+Indexes your OpenWebUI chat history — each message becomes a searchable Qdrant
+point. The `chat_id` UUID in every payload lets a retrieval tool fetch the full
+conversation from OpenWebUI at query time.
+
+**Prerequisites:** generate an API key in OpenWebUI → Settings → Account → API Key.
+Add to `config/.env`:
+
+```ini
+OPENWEBUI_URL=http://your-server:3000
+OPENWEBUI_API_KEY=your_api_key_here
+OPENWEBUI_COLLECTION=openwebui_chats
+```
+
+```bash
+# First run — index everything
+./run.sh openwebui --full -v
+
+# Incremental sync (only chats updated since last run)
+./run.sh openwebui -v
+
+# Dry run (no writes)
+./run.sh openwebui --dry-run -v
+
+# Reprocess specific chats by UUID
+./run.sh openwebui --chats abc-uuid-1 def-uuid-2 -v
+```
+
+Tool calls, system prompts, and empty messages are automatically skipped. Each
+chat's existing points are deleted and replaced on every re-index (idempotent).
+
 ### State Files
 
 Incremental sync state is stored in `config/`:
@@ -269,8 +301,31 @@ Incremental sync state is stored in `config/`:
 - `.papers_sync_state.json`
 - `.feeds_sync_state.json`
 - `.kindle_sync_state.json`
+- `.openwebui_sync_state.json`
 
 Delete a state file to force a full re-sync for that source.
+
+---
+
+## Alerting
+
+All loaders send an email when they exit with a fatal error (missing env vars,
+authentication failure, etc.). Configure SMTP in `config/.env`:
+
+```ini
+ALERT_SMTP_HOST=smtp.gmail.com
+ALERT_SMTP_PORT=587
+ALERT_SMTP_USER=you@gmail.com
+ALERT_SMTP_PASS=your_app_password      # Gmail: use an App Password
+ALERT_FROM=qdrant-loader@example.com
+ALERT_TO=you@example.com              # comma-separated for multiple recipients
+```
+
+Leave `ALERT_SMTP_HOST` blank to disable alerting entirely — the loaders will
+behave exactly as before with no delay or error.
+
+> **Gmail users:** generate an App Password at myaccount.google.com → Security →
+> App passwords. Do not use your account login password.
 
 ---
 
@@ -306,6 +361,7 @@ Sources include:
 - Research papers and documents
 - RSS/Atom news feed articles
 - Kindle book highlights
+- OpenWebUI chat history
 
 The 'collection' parameter lets you target a specific source: 'articles',
 'podcasts', 'feeds', 'kindle', 'documents', or 'all' (default).

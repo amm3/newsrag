@@ -15,15 +15,19 @@ File selection logic:
 import sys
 import os
 import re
+import time
 import argparse
 import logging
 import hashlib
 import json
+import socket
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from alert import send_alert
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -86,7 +90,10 @@ def main():
             api_key=os.environ.get('QDRANT_API_KEY')
         )
 
-    openai_client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
+    openai_client = OpenAI(
+        api_key=os.environ['OPENAI_API_KEY'],
+        max_retries=int(os.environ.get('OPENAI_MAX_RETRIES', 5)),
+    )
 
     # Ensure collection exists
     if not args.dry_run:
@@ -322,9 +329,12 @@ def process_document(document_path: Path, root_dir: Path,
 
     # Generate embeddings in batches
     batch_size = 100
+    embedding_batch_delay = float(os.environ.get('EMBEDDING_BATCH_DELAY', 0))
     points = []
 
     for batch_start in range(0, len(chunks), batch_size):
+        if batch_start > 0 and embedding_batch_delay > 0:
+            time.sleep(embedding_batch_delay)
         batch_chunks = chunks[batch_start:batch_start + batch_size]
         batch_embeddings = get_embeddings(batch_chunks, openai_client, embedding_model)
 
@@ -347,15 +357,21 @@ def process_document(document_path: Path, root_dir: Path,
                 payload['tags'] = header_meta['tags']
             points.append(PointStruct(id=point_id, vector=embedding, payload=payload))
 
-    # Upsert to Qdrant
+    # Upsert to Qdrant in batches to stay under payload size limit
+    qdrant_batch_size = int(os.environ.get('QDRANT_UPSERT_BATCH_SIZE', 500))
     if not dry_run:
-        qdrant.upsert(collection_name=collection_name, points=points)
+        for b in range(0, len(points), qdrant_batch_size):
+            qdrant.upsert(collection_name=collection_name, points=points[b:b + qdrant_batch_size])
 
     return len(points)
 
 
 def log_fatal(msg, exit_code=-1):
     logging.critical(f"Fatal Err: {msg}")
+    send_alert(
+        subject=f"[ALERT] papers_ingest failed on {socket.gethostname()}",
+        body=msg
+    )
     sys.exit(exit_code)
 
 

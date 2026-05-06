@@ -13,11 +13,14 @@ import argparse
 import logging
 import hashlib
 import json
+import socket
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from alert import send_alert
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -153,7 +156,7 @@ def main():
     return 0
 
 
-AUDIO_EXTENSIONS = ['.mp3', '.m4a', '.wav', '.ogg', '.flac']
+AUDIO_EXTENSIONS = ['.mp3', '.m4a', '.mp4', '.wav', '.ogg', '.flac']
 
 
 def find_audio_for(txt_path: Path) -> Path | None:
@@ -347,6 +350,10 @@ def process_transcript(transcript_path: Path, audio_path: Path, root_dir: Path,
 
 def log_fatal(msg, exit_code=-1):
     logging.critical(f"Fatal Err: {msg}")
+    send_alert(
+        subject=f"[ALERT] podcast_ingest failed on {socket.gethostname()}",
+        body=msg
+    )
     sys.exit(exit_code)
 
 

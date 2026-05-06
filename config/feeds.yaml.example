@@ -24,6 +24,13 @@ firecrawl_timeout: 30
 # run with --full once to stamp existing articles and make them eligible.
 max_age_days: 90
 
+# Minimum number of articles to retain per feed, regardless of age.
+# Low-volume feeds that post infrequently won't lose their back catalog to
+# time-based culling as long as total articles stay within this count.
+# The N most-recent articles for each feed are always protected.
+# Default: 20
+min_retention_count: 20
+
 # =============================================================================
 # Feed List
 # =============================================================================

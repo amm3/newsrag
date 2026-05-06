@@ -14,17 +14,20 @@ import time
 import hashlib
 import json
 import re
+import socket
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+from alert import send_alert
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
-    Filter, FieldCondition, MatchValue
+    Filter, FieldCondition, MatchValue, PayloadSchemaType
 )
 
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -231,6 +234,15 @@ def ensure_collection(client: QdrantClient, collection_name: str, dimensions: in
         logging.info(f"Created collection: {collection_name}")
     else:
         logging.debug(f"Collection exists: {collection_name}")
+    try:
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name='is_starred',
+            field_schema=PayloadSchemaType.BOOL
+        )
+        logging.debug("Ensured payload index on is_starred")
+    except Exception as e:
+        logging.debug(f"Payload index on is_starred already exists or failed: {e}")
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -327,10 +339,13 @@ def process_article(article: dict, openai_client: OpenAI,
                 'domain': article.get('domain_name', ''),
                 'reading_time': article.get('reading_time', 0),
                 'created_at': article.get('created_at', ''),
+                'updated_at': article.get('updated_at', ''),
                 'published_at': article.get('published_at', ''),
                 'tags': [t['label'] for t in article.get('tags', [])],
                 'published_by': article.get('published_by', []),
-                'source': 'wallabag'
+                'source': 'wallabag',
+                'is_starred': bool(article.get('is_starred', 0)),
+                'starred_at': article.get('starred_at')
             }
         ))
 
@@ -343,6 +358,10 @@ def process_article(article: dict, openai_client: OpenAI,
 
 def log_fatal(msg, exit_code=-1):
     logging.critical(f"Fatal Err: {msg}")
+    send_alert(
+        subject=f"[ALERT] wallabag_ingest failed on {socket.gethostname()}",
+        body=msg
+    )
     sys.exit(exit_code)
 
 

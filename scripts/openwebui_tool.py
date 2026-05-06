@@ -24,7 +24,7 @@ DOCUMENT_COLLECTIONS_BASE_URL (files live under {base_url}/{collection_name}/).
 title: Qdrant Knowledge Search
 author: adam
 description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, and Kindle highlights)
-version: 1.3.0
+version: 1.4.0
 """
 
 from typing import Callable
@@ -100,6 +100,14 @@ class Tools:
         PODCASTS_BASE_URL: str = Field(
             default="https://static-lan.maddock.net/podcasts",
             description="Base URL for podcast files on the static file server"
+        )
+        COHERE_API_KEY: str = Field(
+            default="",
+            description="Cohere API key for reranking results (leave empty to skip reranking)"
+        )
+        COHERE_RERANK_MODEL: str = Field(
+            default="rerank-english-v3.0",
+            description="Cohere rerank model to use"
         )
 
     def __init__(self):
@@ -341,6 +349,30 @@ class Tools:
             doc_id = payload.get('document_name', payload.get('file_path', payload.get('title', 'unknown')))
             return f"{source}:{doc_id}"
 
+    def _cohere_rerank(self, query: str, points: list) -> list:
+        """Rerank results using Cohere's cross-encoder API. Returns points reordered by relevance."""
+        import requests
+
+        documents = [p.payload.get("text", "") for p in points]
+        resp = requests.post(
+            "https://api.cohere.com/v1/rerank",
+            headers={
+                "Authorization": f"Bearer {self.valves.COHERE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.valves.COHERE_RERANK_MODEL,
+                "query": query,
+                "documents": documents,
+                "top_n": len(documents),
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results = resp.json()["results"]
+        # results is [{index, relevance_score}, ...] ordered by relevance descending
+        return [points[r["index"]] for r in results]
+
     @staticmethod
     def _diversified_top_k(results: list, total_max: int, per_article_max: int) -> list:
         """
@@ -470,6 +502,22 @@ class Tools:
 
             # Diversified top-K: respect per-article limits while filling total budget
             all_results.sort(key=lambda x: x.score, reverse=True)
+
+            if self.valves.COHERE_API_KEY and all_results:
+                if __event_emitter__:
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {"description": f"Reranking {len(all_results)} candidates with Cohere..."}
+                    })
+                try:
+                    all_results = self._cohere_rerank(query, all_results)
+                except Exception as e:
+                    if __event_emitter__:
+                        await __event_emitter__({
+                            "type": "status",
+                            "data": {"description": f"Cohere rerank failed, using embedding scores: {e}"}
+                        })
+
             top_results = self._diversified_top_k(
                 all_results, self.valves.TOP_K, self.valves.PER_ARTICLE_MAX
             )

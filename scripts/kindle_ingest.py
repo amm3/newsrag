@@ -13,11 +13,14 @@ import argparse
 import logging
 import hashlib
 import json
+import socket
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from alert import send_alert
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -270,6 +273,10 @@ def get_embeddings(texts: list[str], client: OpenAI, model: str) -> list[list[fl
 
 def log_fatal(msg, exit_code=-1):
     logging.critical(f"Fatal Err: {msg}")
+    send_alert(
+        subject=f"[ALERT] kindle_ingest failed on {socket.gethostname()}",
+        body=msg
+    )
     sys.exit(exit_code)
 
 
