@@ -236,6 +236,74 @@ class Tools:
                 })
             return error_msg
 
+    async def list_wallabag_tags(
+        self,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        List all tags in Wallabag with article counts.
+
+        Fetches tags directly from the Wallabag API, sorted alphabetically.
+        Article counts are included when the Wallabag instance supports them (v2.5.2+).
+        Useful for exploring what topics have been saved to the knowledge base.
+
+        Returns:
+            A markdown-formatted list of all tags, with article counts if available.
+        """
+        import requests
+
+        if not self.valves.WALLABAG_URL:
+            return "Error: Wallabag URL not configured in tool settings"
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": "Fetching tags from Wallabag..."}
+            })
+
+        try:
+            token = self._get_wallabag_token()
+            url = self.valves.WALLABAG_URL.rstrip('/')
+
+            resp = requests.get(
+                f"{url}/api/tags.json",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30
+            )
+            resp.raise_for_status()
+            tags = resp.json()
+
+            tags.sort(key=lambda t: t.get('label', '').lower())
+
+            has_counts = any(t.get('nbEntries') is not None for t in tags)
+            lines = [f"## Wallabag Tags ({len(tags)} total)\n"]
+            for tag in tags:
+                label = tag.get('label', tag.get('slug', ''))
+                if has_counts:
+                    count = tag.get('nbEntries', 0)
+                    lines.append(f"- **{label}** ({count} articles)")
+                else:
+                    lines.append(f"- **{label}**")
+
+            result = "\n".join(lines)
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Retrieved {len(tags)} tags from Wallabag"}
+                })
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error fetching Wallabag tags: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
     async def get_full_document(
         self,
         file_path: str,
