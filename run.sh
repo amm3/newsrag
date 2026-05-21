@@ -46,12 +46,13 @@ Qdrant RAG Loader - Ingestion Runner
 Usage: ./run.sh <command> [options]
 
 Commands:
-  wallabag    Ingest articles from Wallabag
-  podcasts    Ingest podcast transcripts from filesystem
-  papers      Ingest papers/documents from filesystem
-  kindle      Ingest Kindle highlights from Bookcision JSON exports
-  openwebui   Ingest chat history from OpenWebUI
-  help        Show this help message
+  wallabag      Ingest articles from Wallabag
+  wallabag-cull Remove orphaned Qdrant entries for deleted Wallabag articles
+  podcasts      Ingest podcast transcripts from filesystem
+  papers        Ingest papers/documents from filesystem
+  kindle        Ingest Kindle highlights from Bookcision JSON exports
+  openwebui     Ingest chat history from OpenWebUI
+  help          Show this help message
 
 Wallabag Options:
   --entries ID [ID ...]  Reprocess specific Wallabag entry IDs
@@ -59,6 +60,11 @@ Wallabag Options:
   --dry-run              Don't write to Qdrant
   -v                     Verbose output
   -vv                    Debug output
+
+Wallabag-Cull Options:
+  --dry-run    Show what would be deleted without writing to Qdrant
+  -v           Verbose output
+  -vv          Debug output
 
 Podcast Options:
   --podcast-dir PATH   Directory containing podcast folders (required)
@@ -125,6 +131,10 @@ case "${1:-help}" in
     wallabag)
         shift
         exec python "$SCRIPT_DIR/scripts/wallabag_ingest.py" "$@"
+        ;;
+    wallabag-cull|cull)
+        shift
+        exec python "$SCRIPT_DIR/scripts/wallabag_cull.py" "$@"
         ;;
     podcasts|podcast)
         shift

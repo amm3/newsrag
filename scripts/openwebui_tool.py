@@ -304,6 +304,77 @@ class Tools:
                 })
             return error_msg
 
+    async def add_tag_to_article(
+        self,
+        article_id: int,
+        tag: str,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        Add a single tag to a Wallabag article.
+
+        Only adds the tag — does not remove or replace existing tags. Wallabag
+        will create the tag if it doesn't already exist.
+
+        IMPORTANT: Only call this function when the user explicitly instructs
+        you to add a tag. Never call it proactively or as part of general
+        research and summarization.
+
+        Args:
+            article_id: The Wallabag article ID (from search results)
+            tag: A single tag label to add, e.g. "ai"
+
+        Returns:
+            Confirmation with the article title and resulting tag list.
+        """
+        import requests
+
+        if not self.valves.WALLABAG_URL:
+            return "Error: Wallabag URL not configured in tool settings"
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Adding tag '{tag}' to article {article_id}..."}
+            })
+
+        try:
+            token = self._get_wallabag_token()
+            url = self.valves.WALLABAG_URL.rstrip('/')
+
+            resp = requests.post(
+                f"{url}/api/entries/{article_id}/tags",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"tags": tag.strip()},
+                timeout=30
+            )
+            resp.raise_for_status()
+            entry = resp.json()
+
+            title = entry.get('title', f'Article {article_id}')
+            updated_tags = [t['label'] for t in entry.get('tags', [])]
+
+            result = f"Tag added to **{title}**\n"
+            result += f"Added: {tag.strip()}\n"
+            result += f"All tags: {', '.join(updated_tags)}"
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Tag added to: {title[:50]}"}
+                })
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error adding tag to article {article_id}: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
     async def get_full_document(
         self,
         file_path: str,
