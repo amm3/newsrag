@@ -279,6 +279,12 @@ def process_transcript(transcript_path: Path, audio_path: Path, root_dir: Path,
     show_name = transcript_path.parent.name
     episode_name = transcript_path.stem
 
+    # Extract publish date from filename pattern YYYY-MM-DD_UID_Title
+    published_at = None
+    date_match = re.match(r'^(\d{4}-\d{2}-\d{2})_', transcript_path.name)
+    if date_match:
+        published_at = date_match.group(1)
+
     # Read content
     try:
         content = transcript_path.read_text(encoding='utf-8', errors='replace')
@@ -335,6 +341,7 @@ def process_transcript(transcript_path: Path, audio_path: Path, root_dir: Path,
                 'audio_file': str(audio_path.relative_to(root_dir)),
                 'text': chunk,
                 'modified_at': mtime,
+                'published_at': published_at,
                 'source': 'podcast_transcript',
             }
             if 'tags' in header_meta:
