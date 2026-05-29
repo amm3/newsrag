@@ -5,11 +5,13 @@
 # Activates the Python venv and runs the appropriate script.
 #
 # Usage:
-#   ./run.sh wallabag [options]      - Run Wallabag ingestion
-#   ./run.sh podcasts [options]      - Run podcast transcript ingestion
-#   ./run.sh papers [options]        - Run papers/documents ingestion
-#   ./run.sh feeds [options]         - Run RSS/Atom feed ingestion
-#   ./run.sh help                    - Show this help
+#   ./run.sh [options] wallabag [options]      - Run Wallabag ingestion
+#   ./run.sh [options] podcasts [options]      - Run podcast transcript ingestion
+#   ./run.sh [options] papers [options]        - Run papers/documents ingestion
+#   ./run.sh [options] feeds [options]         - Run RSS/Atom feed ingestion
+#   ./run.sh help                              - Show this help
+#
+# The command name can appear anywhere in the argument list.
 #
 
 set -euo pipefail
@@ -127,42 +129,48 @@ Delete them to force a full re-sync.
 EOF
 }
 
-case "${1:-help}" in
+KNOWN_COMMANDS=(wallabag wallabag-cull cull podcasts podcast papers paper feeds feed kindle openwebui owui help --help -h)
+
+COMMAND=""
+REMAINING=()
+for arg in "$@"; do
+    is_cmd=0
+    if [[ -z "$COMMAND" ]]; then
+        for c in "${KNOWN_COMMANDS[@]}"; do [[ "$arg" == "$c" ]] && is_cmd=1 && break; done
+    fi
+    if [[ $is_cmd -eq 1 ]]; then
+        COMMAND="$arg"
+    else
+        REMAINING+=("$arg")
+    fi
+done
+
+COMMAND="${COMMAND:-help}"
+
+case "$COMMAND" in
     wallabag)
-        shift
-        exec python "$SCRIPT_DIR/scripts/wallabag_ingest.py" "$@"
+        exec python "$SCRIPT_DIR/scripts/wallabag_ingest.py" "${REMAINING[@]}"
         ;;
     wallabag-cull|cull)
-        shift
-        exec python "$SCRIPT_DIR/scripts/wallabag_cull.py" "$@"
+        exec python "$SCRIPT_DIR/scripts/wallabag_cull.py" "${REMAINING[@]}"
         ;;
     podcasts|podcast)
-        shift
-        exec python "$SCRIPT_DIR/scripts/podcast_ingest.py" "$@"
+        exec python "$SCRIPT_DIR/scripts/podcast_ingest.py" "${REMAINING[@]}"
         ;;
     papers|paper)
-        shift
-        exec python "$SCRIPT_DIR/scripts/papers_ingest.py" "$@"
+        exec python "$SCRIPT_DIR/scripts/papers_ingest.py" "${REMAINING[@]}"
         ;;
     feeds|feed)
-        shift
-        exec python "$SCRIPT_DIR/scripts/feeds_ingest.py" "$@"
+        exec python "$SCRIPT_DIR/scripts/feeds_ingest.py" "${REMAINING[@]}"
         ;;
     kindle)
-        shift
-        exec python "$SCRIPT_DIR/scripts/kindle_ingest.py" "$@"
+        exec python "$SCRIPT_DIR/scripts/kindle_ingest.py" "${REMAINING[@]}"
         ;;
     openwebui|owui)
-        shift
-        exec python "$SCRIPT_DIR/scripts/openwebui_chat_loader.py" "$@"
+        exec python "$SCRIPT_DIR/scripts/openwebui_chat_loader.py" "${REMAINING[@]}"
         ;;
     help|--help|-h)
         show_help
         exit 0
-        ;;
-    *)
-        echo "Unknown command: $1"
-        echo "Run './run.sh help' for usage information."
-        exit 1
         ;;
 esac
