@@ -11,7 +11,7 @@ Installation:
 4. Enable the tool for your models
 
 Usage:
-The LLM can call search_knowledge(query, collection) to retrieve relevant
+The LLM can call search_knowledge(query, collection, date_from, date_to, date_field) to retrieve relevant
 context from your indexed articles, transcripts, document collections, and feeds.
 It can call get_full_article(article_id) to fetch full Wallabag article text,
 or get_full_document(file_path, source_type) to fetch full document/podcast text
@@ -24,7 +24,7 @@ DOCUMENT_COLLECTIONS_BASE_URL (files live under {base_url}/{collection_name}/).
 title: Qdrant Knowledge Search
 author: adam
 description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, and Kindle highlights)
-version: 1.4.0
+version: 1.5.1
 """
 
 from typing import Callable
@@ -236,6 +236,145 @@ class Tools:
                 })
             return error_msg
 
+    async def list_wallabag_tags(
+        self,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        List all tags in Wallabag with article counts.
+
+        Fetches tags directly from the Wallabag API, sorted alphabetically.
+        Article counts are included when the Wallabag instance supports them (v2.5.2+).
+        Useful for exploring what topics have been saved to the knowledge base.
+
+        Returns:
+            A markdown-formatted list of all tags, with article counts if available.
+        """
+        import requests
+
+        if not self.valves.WALLABAG_URL:
+            return "Error: Wallabag URL not configured in tool settings"
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": "Fetching tags from Wallabag..."}
+            })
+
+        try:
+            token = self._get_wallabag_token()
+            url = self.valves.WALLABAG_URL.rstrip('/')
+
+            resp = requests.get(
+                f"{url}/api/tags.json",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30
+            )
+            resp.raise_for_status()
+            tags = resp.json()
+
+            tags.sort(key=lambda t: t.get('label', '').lower())
+
+            has_counts = any(t.get('nbEntries') is not None for t in tags)
+            lines = [f"## Wallabag Tags ({len(tags)} total)\n"]
+            for tag in tags:
+                label = tag.get('label', tag.get('slug', ''))
+                if has_counts:
+                    count = tag.get('nbEntries', 0)
+                    lines.append(f"- **{label}** ({count} articles)")
+                else:
+                    lines.append(f"- **{label}**")
+
+            result = "\n".join(lines)
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Retrieved {len(tags)} tags from Wallabag"}
+                })
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error fetching Wallabag tags: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
+    async def add_tag_to_article(
+        self,
+        article_id: int,
+        tag: str,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        Add a single tag to a Wallabag article.
+
+        Only adds the tag — does not remove or replace existing tags. Wallabag
+        will create the tag if it doesn't already exist.
+
+        IMPORTANT: Only call this function when the user explicitly instructs
+        you to add a tag. Never call it proactively or as part of general
+        research and summarization.
+
+        Args:
+            article_id: The Wallabag article ID (from search results)
+            tag: A single tag label to add, e.g. "ai"
+
+        Returns:
+            Confirmation with the article title and resulting tag list.
+        """
+        import requests
+
+        if not self.valves.WALLABAG_URL:
+            return "Error: Wallabag URL not configured in tool settings"
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Adding tag '{tag}' to article {article_id}..."}
+            })
+
+        try:
+            token = self._get_wallabag_token()
+            url = self.valves.WALLABAG_URL.rstrip('/')
+
+            resp = requests.post(
+                f"{url}/api/entries/{article_id}/tags",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"tags": tag.strip()},
+                timeout=30
+            )
+            resp.raise_for_status()
+            entry = resp.json()
+
+            title = entry.get('title', f'Article {article_id}')
+            updated_tags = [t['label'] for t in entry.get('tags', [])]
+
+            result = f"Tag added to **{title}**\n"
+            result += f"Added: {tag.strip()}\n"
+            result += f"All tags: {', '.join(updated_tags)}"
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Tag added to: {title[:50]}"}
+                })
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error adding tag to article {article_id}: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
     async def get_full_document(
         self,
         file_path: str,
@@ -406,10 +545,71 @@ class Tools:
 
         return selected
 
+    def _build_date_filter(self, coll_name: str, date_from: str, date_to: str, date_mode: str):
+        """
+        Build a Qdrant Filter for date range, or return None if no filtering needed.
+
+        date_from / date_to are ISO date strings (YYYY-MM-DD), either may be None.
+        date_mode is "published" (publication date) or "indexed" (ingest/save date).
+        The correct payload key is resolved per collection type internally.
+        """
+        if not date_from and not date_to:
+            return None
+
+        from datetime import date, datetime, timezone
+        from qdrant_client.models import DatetimeRange, Filter, FieldCondition, Range
+
+        is_feeds = coll_name == self.valves.FEEDS_COLLECTION
+        is_wallabag = coll_name == self.valves.WALLABAG_COLLECTION
+        is_podcast = coll_name == self.valves.PODCAST_COLLECTION
+        is_doc = coll_name in self._get_document_collection_names()
+
+        if date_mode == "indexed":
+            if is_wallabag:
+                payload_key = "created_at"
+            elif is_feeds:
+                payload_key = "published_ts"  # best proxy — feeds have no ingest timestamp
+            elif is_podcast or is_doc:
+                payload_key = "modified_at"
+            else:
+                return None  # Kindle — no date fields
+        else:  # "published" (default)
+            if is_feeds:
+                payload_key = "published_ts"
+            elif is_wallabag or is_podcast:
+                payload_key = "published_at"
+            elif is_doc:
+                payload_key = "modified_at"
+            else:
+                return None  # Kindle — no date fields
+
+        range_kwargs = {}
+        if payload_key == "published_ts":
+            # published_ts is a Unix float — use numeric Range
+            def _iso_to_ts(s):
+                return datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp()
+            if date_from:
+                range_kwargs["gte"] = _iso_to_ts(date_from)
+            if date_to:
+                range_kwargs["lte"] = _iso_to_ts(date_to)
+            range_filter = Range(**range_kwargs)
+        else:
+            # Use DatetimeRange for proper datetime payload fields
+            if date_from:
+                range_kwargs["gte"] = date.fromisoformat(date_from)
+            if date_to:
+                range_kwargs["lte"] = date.fromisoformat(date_to)
+            range_filter = DatetimeRange(**range_kwargs)
+
+        return Filter(must=[FieldCondition(key=payload_key, range=range_filter)])
+
     async def search_knowledge(
         self,
         query: str,
         collection: str = "all",
+        date_from: str = None,
+        date_to: str = None,
+        date_mode: str = "published",
         __event_emitter__: Callable[[dict], None] = None,
     ) -> str:
         """
@@ -428,6 +628,13 @@ class Tools:
                         - 'documents' for all document collections
                         - a specific collection name (e.g. 'papers', 'books')
                         - 'all' for everything (default)
+            date_from: Optional start of date range, ISO format (YYYY-MM-DD).
+                       If omitted with date_to set, searches from inception to date_to.
+            date_to: Optional end of date range, ISO format (YYYY-MM-DD).
+                     If omitted with date_from set, searches from date_from to present.
+            date_mode: Which date concept to filter on:
+                       - 'published' (default) — article/episode publication date
+                       - 'indexed' — when the item was added/saved to the knowledgebase
 
         Returns:
             Relevant context from the knowledge base, formatted with source information
@@ -482,23 +689,49 @@ class Tools:
             all_results = []
 
             for coll_name in collections:
+                fetch_limit = self.valves.TOP_K * 3
+                date_filter = self._build_date_filter(coll_name, date_from, date_to, date_mode)
+                results = None
                 try:
-                    # Fetch extra candidates to allow diversification across articles
-                    fetch_limit = self.valves.TOP_K * 3
                     results = qdrant.query_points(
                         collection_name=coll_name,
                         query=query_vector,
+                        query_filter=date_filter,
                         limit=fetch_limit
                     )
+                    # If the date filter produced no results, retry without it so the
+                    # collection still contributes its best semantic matches
+                    if not results.points and date_filter is not None:
+                        results = qdrant.query_points(
+                            collection_name=coll_name,
+                            query=query_vector,
+                            limit=fetch_limit
+                        )
+                except Exception as e:
+                    if date_filter is not None:
+                        # Filtered query failed — retry without the date filter
+                        try:
+                            results = qdrant.query_points(
+                                collection_name=coll_name,
+                                query=query_vector,
+                                limit=fetch_limit
+                            )
+                        except Exception as e2:
+                            if __event_emitter__:
+                                await __event_emitter__({
+                                    "type": "status",
+                                    "data": {"description": f"Warning: Could not search {coll_name}: {e2}"}
+                                })
+                    else:
+                        if __event_emitter__:
+                            await __event_emitter__({
+                                "type": "status",
+                                "data": {"description": f"Warning: Could not search {coll_name}: {e}"}
+                            })
+                if results is not None:
                     for point in results.points:
                         point._collection_name = coll_name
                     all_results.extend(results.points)
-                except Exception as e:
-                    if __event_emitter__:
-                        await __event_emitter__({
-                            "type": "status",
-                            "data": {"description": f"Warning: Could not search {coll_name}: {e}"}
-                        })
 
             # Diversified top-K: respect per-article limits while filling total budget
             all_results.sort(key=lambda x: x.score, reverse=True)
