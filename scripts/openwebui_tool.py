@@ -375,6 +375,99 @@ class Tools:
                 })
             return error_msg
 
+    async def remove_tag_from_article(
+        self,
+        article_id: int,
+        tag: str,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        Remove a single tag from a Wallabag article.
+
+        Only removes the specified tag — all other tags on the article are left
+        unchanged. If the tag is not present on the article, returns an error.
+
+        IMPORTANT: Only call this function when the user explicitly instructs
+        you to remove a tag. Never call it proactively or as part of general
+        research and summarization.
+
+        Args:
+            article_id: The Wallabag article ID (from search results)
+            tag: The tag label to remove, e.g. "ai"
+
+        Returns:
+            Confirmation with the article title and remaining tag list.
+        """
+        import requests
+
+        if not self.valves.WALLABAG_URL:
+            return "Error: Wallabag URL not configured in tool settings"
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Removing tag '{tag}' from article {article_id}..."}
+            })
+
+        try:
+            token = self._get_wallabag_token()
+            url = self.valves.WALLABAG_URL.rstrip('/')
+            headers = {"Authorization": f"Bearer {token}"}
+
+            entry_resp = requests.get(
+                f"{url}/api/entries/{article_id}.json",
+                headers=headers,
+                timeout=30
+            )
+            entry_resp.raise_for_status()
+            entry = entry_resp.json()
+
+            tag_label = tag.strip().lower()
+            matching_tag = next(
+                (t for t in entry.get('tags', []) if t.get('label', '').lower() == tag_label),
+                None
+            )
+            if matching_tag is None:
+                title = entry.get('title', f'Article {article_id}')
+                current_tags = [t['label'] for t in entry.get('tags', [])]
+                return (
+                    f"Tag '{tag.strip()}' not found on **{title}**\n"
+                    f"Current tags: {', '.join(current_tags) or '(none)'}"
+                )
+
+            tag_id = matching_tag['id']
+            del_resp = requests.delete(
+                f"{url}/api/entries/{article_id}/tags/{tag_id}",
+                headers=headers,
+                timeout=30
+            )
+            del_resp.raise_for_status()
+            updated_entry = del_resp.json()
+
+            title = updated_entry.get('title', f'Article {article_id}')
+            remaining_tags = [t['label'] for t in updated_entry.get('tags', [])]
+
+            result = f"Tag removed from **{title}**\n"
+            result += f"Removed: {tag.strip()}\n"
+            result += f"Remaining tags: {', '.join(remaining_tags) or '(none)'}"
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Tag removed from: {title[:50]}"}
+                })
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error removing tag from article {article_id}: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
     async def get_full_document(
         self,
         file_path: str,

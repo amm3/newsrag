@@ -279,11 +279,19 @@ def process_transcript(transcript_path: Path, audio_path: Path, root_dir: Path,
     show_name = transcript_path.parent.name
     episode_name = transcript_path.stem
 
-    # Extract publish date from filename pattern YYYY-MM-DD_UID_Title
+    # Prefer DD MMM YYYY embedded in filename (e.g. "27 Jun 2021", "26 Apr 2026")
     published_at = None
-    date_match = re.match(r'^(\d{4}-\d{2}-\d{2})_', transcript_path.name)
-    if date_match:
-        published_at = date_match.group(1)
+    embedded_match = re.search(r'\b(\d{1,2} \w{3} \d{4})\b', transcript_path.stem)
+    if embedded_match:
+        try:
+            published_at = datetime.strptime(embedded_match.group(1), "%d %b %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    # Fall back to YYYY-MM-DD prefix
+    if published_at is None:
+        prefix_match = re.match(r'^(\d{4}-\d{2}-\d{2})_', transcript_path.name)
+        if prefix_match:
+            published_at = prefix_match.group(1)
 
     # Read content
     try:
