@@ -346,6 +346,12 @@ Configure the Tool's Valves (settings):
 - `KINDLE_COLLECTION`: Qdrant collection name (default: `kindle_highlights`)
 - `DOCUMENT_COLLECTIONS`: Comma-separated collection names for document sources (default: `papers`)
 
+### Skills File
+
+[openwebui_skill.md](openwebui_skill.md) is a pre-written Skills document you can paste directly into OpenWebUI (Workspace → Skills → Create). It provides the AI model with detailed guidance on how and when to use every tool in the toolkit — when to call `search_knowledge` vs `get_articles_by_tag`, how to interpret results, how to filter by date or tag, how to fetch full content, and how to handle edge cases.
+
+Copy the contents of `openwebui_skill.md` into the skill body and save it, then enable it alongside the Tool for the model you're using.
+
 ### System Prompt Enhancement
 
 For models that should automatically use your knowledge base, add to the system prompt:
@@ -503,6 +509,7 @@ qdrant_loader/
 ├── run.sh                    # Wrapper script (activates venv)
 ├── docker-compose.yml        # Qdrant container
 ├── requirements.txt          # Python dependencies
+├── openwebui_skill.md        # OpenWebUI Skill document (paste into Workspace → Skills)
 ├── config/
 │   ├── .env.example          # Template configuration
 │   ├── .env                  # Your configuration (git-ignored)

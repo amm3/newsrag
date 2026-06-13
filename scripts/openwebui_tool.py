@@ -24,7 +24,7 @@ DOCUMENT_COLLECTIONS_BASE_URL (files live under {base_url}/{collection_name}/).
 title: Qdrant Knowledge Search
 author: adam
 description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, and Kindle highlights)
-version: 1.5.1
+version: 1.6.0
 """
 
 from typing import Callable
@@ -297,6 +297,119 @@ class Tools:
 
         except Exception as e:
             error_msg = f"Error fetching Wallabag tags: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
+    async def get_articles_by_tag(
+        self,
+        tag: str,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        Fetch all Wallabag articles that have a specific tag.
+
+        Uses the Wallabag API to retrieve a complete, exact-match list of every
+        article carrying the given tag label. For semantic/fuzzy discovery of
+        articles related to a topic, use search_knowledge() with tag= instead.
+
+        Args:
+            tag: The tag label to filter by (case-insensitive, exact match)
+
+        Returns:
+            A markdown-formatted list of all matching articles with title,
+            ID, domain, URL, published date, and full tag list.
+        """
+        import requests
+
+        MAX_ARTICLES = 500
+        PER_PAGE = 30
+
+        if not self.valves.WALLABAG_URL:
+            return "Error: Wallabag URL not configured in tool settings"
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Fetching articles tagged '{tag.strip()}' from Wallabag..."}
+            })
+
+        try:
+            token = self._get_wallabag_token()
+            url = self.valves.WALLABAG_URL.rstrip('/')
+            headers = {"Authorization": f"Bearer {token}"}
+
+            articles = []
+            page = 1
+            total_pages = 1
+            total = 0
+
+            while page <= total_pages and len(articles) < MAX_ARTICLES:
+                resp = requests.get(
+                    f"{url}/api/entries.json",
+                    headers=headers,
+                    params={
+                        "tags": tag.strip(),
+                        "page": page,
+                        "perPage": PER_PAGE,
+                        "sort": "created",
+                        "order": "desc",
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                total_pages = data.get("pages", 1)
+                total = data.get("total", 0)
+                items = data.get("_embedded", {}).get("items", [])
+                if not items:
+                    break
+                articles.extend(items)
+                page += 1
+
+            if not articles:
+                return f"No articles found with tag **{tag.strip()}**."
+
+            lines = [f"## Articles tagged '{tag.strip()}' ({total} total)\n"]
+
+            for entry in articles[:MAX_ARTICLES]:
+                title = entry.get("title") or "Untitled"
+                entry_id = entry.get("id")
+                domain = entry.get("domain_name") or ""
+                entry_url = entry.get("url") or ""
+                published = entry.get("published_at") or entry.get("created_at") or ""
+                if published and "T" in published:
+                    published = published.split("T")[0]
+                entry_tags = [t["label"] for t in entry.get("tags", [])]
+
+                line = f"- **{title}** (ID: {entry_id})"
+                if domain:
+                    line += f" — {domain}"
+                if published:
+                    line += f" · {published}"
+                if entry_url:
+                    line += f"\n  {entry_url}"
+                if entry_tags:
+                    line += f"\n  Tags: {', '.join(entry_tags)}"
+                lines.append(line)
+
+            if len(articles) >= MAX_ARTICLES and total > MAX_ARTICLES:
+                lines.append(f"\n_(Showing first {MAX_ARTICLES} of {total} articles.)_")
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Retrieved {min(len(articles), MAX_ARTICLES)} articles tagged '{tag.strip()}'"}
+                })
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            error_msg = f"Error fetching articles by tag '{tag}': {str(e)}"
             if __event_emitter__:
                 await __event_emitter__({
                     "type": "status",
@@ -696,6 +809,18 @@ class Tools:
 
         return Filter(must=[FieldCondition(key=payload_key, range=range_filter)])
 
+    def _build_tag_condition(self, coll_name: str, tag: str):
+        """Return a FieldCondition matching tag in the tags array, or None if not applicable."""
+        from qdrant_client.models import FieldCondition, MatchValue
+        has_tags = (
+            coll_name == self.valves.WALLABAG_COLLECTION
+            or coll_name == self.valves.FEEDS_COLLECTION
+            or coll_name == self.valves.PODCAST_COLLECTION
+        )
+        if not has_tags:
+            return None
+        return FieldCondition(key="tags", match=MatchValue(value=tag.strip().lower()))
+
     async def search_knowledge(
         self,
         query: str,
@@ -703,6 +828,7 @@ class Tools:
         date_from: str = None,
         date_to: str = None,
         date_mode: str = "published",
+        tag: str = None,
         __event_emitter__: Callable[[dict], None] = None,
     ) -> str:
         """
@@ -728,6 +854,9 @@ class Tools:
             date_mode: Which date concept to filter on:
                        - 'published' (default) — article/episode publication date
                        - 'indexed' — when the item was added/saved to the knowledgebase
+            tag: Optional tag label to restrict results to (exact match, case-insensitive).
+                 Only applies to Wallabag articles, RSS feed articles, and podcasts.
+                 Use get_articles_by_tag() instead when you need a complete listing.
 
         Returns:
             Relevant context from the knowledge base, formatted with source information
@@ -779,17 +908,30 @@ class Tools:
                 valid = ["articles", "podcasts", "feeds", "kindle", "documents", "all"] + doc_names
                 return f"Unknown collection: {collection}. Valid options: {', '.join(valid)}"
 
+            from qdrant_client.models import Filter as QFilter
+
             all_results = []
 
             for coll_name in collections:
                 fetch_limit = self.valves.TOP_K * 3
                 date_filter = self._build_date_filter(coll_name, date_from, date_to, date_mode)
+                tag_cond = self._build_tag_condition(coll_name, tag) if tag else None
+
+                if date_filter and tag_cond:
+                    combined_filter = QFilter(must=[*date_filter.must, tag_cond])
+                elif tag_cond:
+                    combined_filter = QFilter(must=[tag_cond])
+                else:
+                    combined_filter = date_filter  # may be None
+                # Fallback omits date but keeps tag (if any)
+                fallback_filter = QFilter(must=[tag_cond]) if tag_cond else None
+
                 results = None
                 try:
                     results = qdrant.query_points(
                         collection_name=coll_name,
                         query=query_vector,
-                        query_filter=date_filter,
+                        query_filter=combined_filter,
                         limit=fetch_limit
                     )
                     # If the date filter produced no results, retry without it so the
@@ -798,6 +940,7 @@ class Tools:
                         results = qdrant.query_points(
                             collection_name=coll_name,
                             query=query_vector,
+                            query_filter=fallback_filter,
                             limit=fetch_limit
                         )
                 except Exception as e:
@@ -807,6 +950,7 @@ class Tools:
                             results = qdrant.query_points(
                                 collection_name=coll_name,
                                 query=query_vector,
+                                query_filter=fallback_filter,
                                 limit=fetch_limit
                             )
                         except Exception as e2:
