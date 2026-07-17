@@ -174,10 +174,11 @@ class Tools:
         """
         import requests
         import re
-        
+        import html
+
         if not self.valves.WALLABAG_URL:
             return "Error: Wallabag URL not configured in tool settings"
-        
+
         if __event_emitter__:
             await __event_emitter__({
                 "type": "status",
@@ -199,8 +200,23 @@ class Tools:
             title = article.get('title', 'Untitled')
             content = article.get('content', '')
             
-            # Strip HTML tags
-            clean_content = re.sub(r'<[^>]+>', '', content)
+            # Convert HTML links to markdown links, then strip remaining HTML tags
+            def _markdown_link(match):
+                href = html.unescape(match.group(1))
+                text = re.sub(r'<[^>]+>', '', match.group(2))
+                text = html.unescape(text).strip()
+                if not text:
+                    return href
+                return f"[{text}]({href})"
+
+            clean_content = re.sub(
+                r'<a\s+[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>',
+                _markdown_link,
+                content,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            clean_content = re.sub(r'<[^>]+>', '', clean_content)
+            clean_content = html.unescape(clean_content)
             clean_content = re.sub(r'\s+', ' ', clean_content).strip()
             
             domain = article.get('domain_name', '')
