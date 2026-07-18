@@ -352,6 +352,7 @@ def process_transcript(transcript_path: Path, audio_path: Path, root_dir: Path,
                 'published_at': published_at,
                 'source': 'podcast_transcript',
             }
+            payload.update({k: v for k, v in header_meta.items() if k != 'tags'})
             if 'tags' in header_meta:
                 payload['tags'] = header_meta['tags']
             points.append(PointStruct(id=point_id, vector=embedding, payload=payload))
