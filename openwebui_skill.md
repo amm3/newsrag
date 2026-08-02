@@ -3,16 +3,16 @@
 ## Available Tools
 
 ### `search_knowledge`
-Search a personal knowledge base of saved Wallabag articles, podcast transcripts, document collections, RSS/Atom news feed articles, and Kindle book highlights stored in Qdrant.
+Search a personal knowledge base of saved Wallabag articles, podcast transcripts, document collections, RSS/Atom news feed articles, Kindle book highlights, and AI-generated podcast/paper summaries stored in Qdrant.
 
 - **When to use**: When the user asks a question that could benefit from their personal saved content — articles they've bookmarked, podcast episodes they've listened to, papers/essays/books they've collected, news articles from their feeds, Kindle highlights from books they've read, or any topic they may have encountered in their reading/listening history.
 - **Parameters**:
   - `query` — The search query describing what to look for.
-  - `collection` — Which collection to search: `"articles"` for Wallabag only, `"podcasts"` for podcast transcripts only, `"feeds"` for RSS/Atom news feed articles only, `"kindle"` for Kindle book highlights only, `"documents"` for all document collections, a specific collection name (e.g. `"papers"`, `"books"`), or `"all"` for everything (default).
+  - `collection` — Which collection to search: `"articles"` for Wallabag only, `"podcasts"` for podcast transcripts only, `"feeds"` for RSS/Atom news feed articles only, `"kindle"` for Kindle book highlights only, `"summaries"` for AI-generated podcast/paper summaries only (see [Understanding AI-generated summaries](#understanding-ai-generated-summaries) — already included automatically under `"all"`), `"documents"` for all document collections, a specific collection name (e.g. `"papers"`, `"books"`), or `"all"` for everything (default).
   - `date_from` — Optional start of date range, ISO format (`YYYY-MM-DD`). If omitted with `date_to` set, searches from inception to `date_to`.
   - `date_to` — Optional end of date range, ISO format (`YYYY-MM-DD`). If omitted with `date_from` set, searches from `date_from` to present.
   - `date_mode` — Which date concept to filter on: `"published"` (default) for article/episode publication date; `"indexed"` for when the item was added/saved to the knowledgebase. The tool resolves the correct payload field per collection internally.
-  - `tag` — Optional tag label to restrict results to (exact match, case-insensitive). Only filters Wallabag articles, RSS feed articles, and podcasts; Kindle and document collections are unaffected. Use `get_articles_by_tag()` instead when you need a **complete listing** of all articles with a tag rather than a semantic top-K.
+  - `tag` — Optional tag label to restrict results to (exact match, case-insensitive). Only filters Wallabag articles, RSS feed articles, podcasts, and AI-generated summaries; Kindle and document collections are unaffected. Use `get_articles_by_tag()` instead when you need a **complete listing** of all articles with a tag rather than a semantic top-K.
 
 ### `get_full_article`
 Fetch the complete text of a Wallabag article by its ID.
@@ -59,6 +59,7 @@ Fetch the full text of a document or podcast transcript from the static file ser
 - **Parameters**:
   - `file_path` — The relative file path from search results (e.g., `"paper_name.md"` or `"ShowName/Episode.txt"`). Use the raw path with normal spaces — do NOT use URL-encoded paths from transcript/audio URLs.
   - `source_type` — The **collection name** from search results (the `Collection` field, e.g. `"papers"`, `"books"`). For podcasts use `"podcasts"`. The collection name determines the folder in the URL. Default: `"papers"`.
+  - For AI-generated summary results specifically, use the result's own `Source file` and `Source type` fields directly (`source_type` will be `"podcast"` or `"paper"`) — these resolve the same way podcast/document source types already do, no translation needed.
 
 ## Configuration (Valves)
 
@@ -69,7 +70,7 @@ Key settings that must be configured for the tool to work:
 - **OPENAI_API_KEY** — Required for generating query embeddings via `text-embedding-3-small`
 - **TOP_K** (default: 8) — Total number of results to return
 - **PER_ARTICLE_MAX** (default: 2) — Preferred max results from any single article/episode, to keep results diverse
-- **WALLABAG_COLLECTION** / **PODCAST_COLLECTION** / **FEEDS_COLLECTION** / **KINDLE_COLLECTION** — Qdrant collection names for Wallabag, podcasts, RSS/Atom feeds, and Kindle highlights (defaults: `wallabag_articles`, `podcast_transcripts`, `news_feeds`, `kindle_highlights`)
+- **WALLABAG_COLLECTION** / **PODCAST_COLLECTION** / **FEEDS_COLLECTION** / **KINDLE_COLLECTION** / **SUMMARIES_COLLECTION** — Qdrant collection names for Wallabag, podcasts, RSS/Atom feeds, Kindle highlights, and AI-generated summaries (defaults: `wallabag_articles`, `podcast_transcripts`, `news_feeds`, `kindle_highlights`, `summaries`)
 - **DOCUMENT_COLLECTIONS** — Comma-separated Qdrant collection names for document collections (e.g., `"papers,books,manuals"`)
 - **DOCUMENT_COLLECTIONS_BASE_URL** — Base URL for document collections; files are served at `{base_url}/{collection_name}/...` (default: `https://static-lan.maddock.net`)
 - **PODCASTS_BASE_URL** — Base URL for podcast files on the static file server (default: `https://static-lan.maddock.net/podcasts`)
@@ -85,7 +86,7 @@ When the user asks something that sounds like it could draw on their saved readi
 3. Synthesize an answer from the relevant snippets, citing sources.
 
 ### Narrowing by collection
-If the user specifically mentions articles, reading, or bookmarks, use `collection="articles"`. If they mention podcasts or episodes, use `collection="podcasts"`. If they mention news, feeds, or recent articles from a specific publication, use `collection="feeds"`. If they mention Kindle highlights, book highlights, or annotations, use `collection="kindle"`. If they mention papers, essays, books, or reference documents, use `collection="documents"` or a specific collection name like `"papers"`. Default to `"all"` when unsure.
+If the user specifically mentions articles, reading, or bookmarks, use `collection="articles"`. If they mention podcasts or episodes, use `collection="podcasts"`. If they mention news, feeds, or recent articles from a specific publication, use `collection="feeds"`. If they mention Kindle highlights, book highlights, or annotations, use `collection="kindle"`. If they mention papers, essays, books, or reference documents, use `collection="documents"` or a specific collection name like `"papers"`. Default to `"all"` when unsure — this already includes AI-generated summaries; only use `collection="summaries"` explicitly if the user specifically wants to browse summaries themselves (rare — see [Understanding AI-generated summaries](#understanding-ai-generated-summaries)).
 
 ### Linking to Wallabag articles
 When the user asks for a link to a Wallabag article, use the article ID from search results to construct the URL:
@@ -99,6 +100,7 @@ If a search snippet is promising but incomplete:
 
 - **For Wallabag articles**: Note the `Article ID` from the search results, then call `get_full_article` with that ID.
 - **For documents or podcasts**: Note the `File` path and `Collection` name from the search results, then call `get_full_document` with that `file_path` and the `Collection` value as `source_type`. The collection name determines which folder the file is served from.
+- **For AI-generated summaries**: Note the `Source file` and `Source type` fields from the result (not `File`/`Collection` — a summary points back to a *different* underlying file). Call `get_full_document` with `file_path=<Source file>` and `source_type=<Source type>` to retrieve the actual transcript/paper the summary was generated from. Do this — or re-run `search_knowledge` against the full-text collection — before presenting any specifics from a summary as fact.
 
 ### Exploring saved content by tag
 If the user asks "what tags do I have?" or "what topics have I saved?" or wants to browse their Wallabag by subject:
@@ -116,7 +118,7 @@ When the user asks for every article with a specific tag ("show me all articles 
 When the user wants to find the most relevant content about a topic, scoped to articles that carry a specific tag ("search my 'ai' articles for transformer architecture"):
 
 - Call `search_knowledge(query="transformer architecture", collection="articles", tag="ai")` — runs vector search restricted to articles carrying that tag.
-- The `tag` filter applies to Wallabag articles, RSS feed articles, and podcasts; Kindle and document collections are unaffected and contribute their normal semantic results.
+- The `tag` filter applies to Wallabag articles, RSS feed articles, podcasts, and AI-generated summaries; Kindle and document collections are unaffected and contribute their normal semantic results.
 
 ### Filtering by date or time range
 When the user asks about content from a specific period (e.g. "articles I saved last month", "podcasts from 2023", "news from this week"):
@@ -140,6 +142,15 @@ If the user asks a broad question like "what have I saved about climate policy":
 2. Results are diversified — the tool limits results per article/episode so you get breadth across different sources rather than multiple chunks from the same piece.
 3. If a particular source looks especially relevant, use `get_full_article` (for Wallabag articles) or `get_full_document` (for documents/podcasts) to go deeper.
 
+### Understanding AI-generated summaries
+The `summaries` collection (folded into `collection="all"`) holds AI-generated synthesis of podcast transcripts and papers — one summary per source file, written to describe themes and concepts rather than recap chronologically. They exist purely to widen semantic search recall: a summary may phrase an idea differently than the original transcript or paper, so a query can surface relevant content even when it shares no exact wording with the source.
+
+**Critical: never treat a summary's text as ground truth.** It is a retrieval aid, not a citable fact. Whenever a `search_knowledge` result is an AI summary:
+
+1. Use it to identify that the underlying podcast episode or paper is relevant.
+2. Before stating specifics to the user, retrieve the real content — call `get_full_document(file_path=<result's "Source file">, source_type=<result's "Source type">)`, or run `search_knowledge` again against the full-text collection (`collection="podcasts"` or the papers/documents collection) — and cite that instead.
+3. Only fall back to paraphrasing the summary itself if the full source is unavailable, and if you do, tell the user explicitly it's from an AI-generated summary, not the original text.
+
 ## Interpreting Results
 
 - Results include a relevance score. Higher-scored results appear first.
@@ -148,6 +159,7 @@ If the user asks a broad question like "what have I saved about climate policy":
 - Feed results show: article title, feed name, article URL, published date, author, and tags. The article URL links directly to the original source — no `get_full_document` call is needed; direct the user to the URL if they want the full content.
 - Kindle results show: book title, author, location value, and an optional Kindle deep link. Each result is a highlight (annotation) from a Kindle book.
 - Document results show: document name, collection name, file path, and a URL to the original file (if a base URL is configured for that collection). The `Collection` field indicates which Qdrant collection the result came from and should be used as the `source_type` when calling `get_full_document`.
+- Summary results show: an explicit "AI Summary" label, podcast (show/episode) or paper (document name) identity, title/URL/tags when available, and the `Source file`/`Source type` needed to fetch the real content. **These are AI-generated synthesis, not the original text — never present their content as fact**; see [Understanding AI-generated summaries](#understanding-ai-generated-summaries).
 - Each result contains a text snippet — the most relevant chunk from the original content.
 - If no results are found, the topic likely wasn't covered in the user's saved content. Say so clearly rather than speculating.
 
@@ -159,4 +171,5 @@ If the user asks a broad question like "what have I saved about climate policy":
 - `get_full_document` requires `DOCUMENT_COLLECTIONS_BASE_URL` to be configured. If not set, it will return an error for document collections.
 - Podcast transcript quality depends on the upstream transcription. Some results may contain transcription artifacts.
 - Document results depend on the quality of the .md/.txt conversion from the original format. Some converted documents may have formatting artifacts.
+- AI-generated summaries synthesize themes conceptually rather than recapping verbatim — they may use terminology the original source never used. This is intentional (it's what makes them useful for recall), but their wording should never be quoted as if it were the source's own words.
 - **Important**: When calling `get_full_document`, use the raw `file_path` value from search result metadata — the path with normal spaces and characters (e.g., `Show Name/Episode.txt`). Do NOT copy the path from a Transcript or Audio URL, as those are URL-encoded (e.g., `Show%20Name/Episode.txt`) and will cause a 404 error due to double-encoding.

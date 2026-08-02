@@ -2,7 +2,8 @@
 OpenWebUI Tool: Qdrant Knowledge Search
 
 Search personal knowledge base (Wallabag articles, podcast transcripts, document
-collections, RSS/Atom news feeds, and Kindle book highlights) stored in Qdrant.
+collections, RSS/Atom news feeds, Kindle book highlights, and AI-generated
+podcast/paper summaries) stored in Qdrant.
 
 Installation:
 1. In OpenWebUI, go to Workspace → Tools → Create
@@ -11,8 +12,9 @@ Installation:
 4. Enable the tool for your models
 
 Usage:
-The LLM can call search_knowledge(query, collection, date_from, date_to, date_field) to retrieve relevant
-context from your indexed articles, transcripts, document collections, and feeds.
+The LLM can call search_knowledge(query, collection, date_from, date_to, date_mode, tag) to
+retrieve relevant context from your indexed articles, transcripts, document collections,
+feeds, and summaries.
 It can call get_full_article(article_id) to fetch full Wallabag article text,
 or get_full_document(file_path, source_type) to fetch full document/podcast text
 from the static file server.
@@ -21,10 +23,16 @@ Document collections beyond wallabag and podcasts are configurable via the
 DOCUMENT_COLLECTIONS Valve (comma-separated collection names) and
 DOCUMENT_COLLECTIONS_BASE_URL (files live under {base_url}/{collection_name}/).
 
+AI-generated summaries (from a separate summarization pipeline, not Wallabag)
+live in the SUMMARIES_COLLECTION collection and exist purely to widen semantic
+recall for podcasts/papers. They are never ground truth — always resolve back
+to the real transcript/paper via get_full_document (using the summary result's
+source_file + source_type) before citing specifics.
+
 title: Qdrant Knowledge Search
 author: adam
-description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, and Kindle highlights)
-version: 1.6.0
+description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, RSS/Atom feeds, Kindle highlights, and AI-generated summaries)
+version: 1.7.0
 """
 
 from typing import Callable
@@ -68,6 +76,10 @@ class Tools:
         KINDLE_COLLECTION: str = Field(
             default="kindle_highlights",
             description="Qdrant collection name for Kindle book highlights"
+        )
+        SUMMARIES_COLLECTION: str = Field(
+            default="summaries",
+            description="Qdrant collection name for AI-generated podcast/paper summaries"
         )
         DOCUMENT_COLLECTIONS: str = Field(
             default="papers",
@@ -706,6 +718,11 @@ class Tools:
             return f"feed:{payload.get('entry_id', payload.get('title', 'unknown'))}"
         elif source == "kindle":
             return f"kindle:{payload.get('asin', payload.get('book_title', 'unknown'))}"
+        elif source == "summary":
+            if payload.get("source_type") == "podcast":
+                return f"summary:podcast:{payload.get('show_name', '')}:{payload.get('episode_name', '')}"
+            else:
+                return f"summary:paper:{payload.get('document_name', payload.get('title', 'unknown'))}"
         else:
             doc_id = payload.get('document_name', payload.get('file_path', payload.get('title', 'unknown')))
             return f"{source}:{doc_id}"
@@ -785,21 +802,22 @@ class Tools:
         is_wallabag = coll_name == self.valves.WALLABAG_COLLECTION
         is_podcast = coll_name == self.valves.PODCAST_COLLECTION
         is_doc = coll_name in self._get_document_collection_names()
+        is_summaries = coll_name == self.valves.SUMMARIES_COLLECTION
 
         if date_mode == "indexed":
             if is_wallabag:
                 payload_key = "created_at"
             elif is_feeds:
                 payload_key = "published_ts"  # best proxy — feeds have no ingest timestamp
-            elif is_podcast or is_doc:
+            elif is_podcast or is_doc or is_summaries:
                 payload_key = "modified_at"
             else:
                 return None  # Kindle — no date fields
         else:  # "published" (default)
             if is_feeds:
                 payload_key = "published_ts"
-            elif is_wallabag or is_podcast:
-                payload_key = "published_at"
+            elif is_wallabag or is_podcast or is_summaries:
+                payload_key = "published_at"  # summaries: reliable for podcast-type, sparse for paper-type
             elif is_doc:
                 payload_key = "modified_at"
             else:
@@ -832,6 +850,7 @@ class Tools:
             coll_name == self.valves.WALLABAG_COLLECTION
             or coll_name == self.valves.FEEDS_COLLECTION
             or coll_name == self.valves.PODCAST_COLLECTION
+            or coll_name == self.valves.SUMMARIES_COLLECTION
         )
         if not has_tags:
             return None
@@ -860,6 +879,8 @@ class Tools:
                         - 'podcasts' for podcast transcripts only
                         - 'feeds' for RSS/Atom news feed articles only
                         - 'kindle' for Kindle book highlights only
+                        - 'summaries' for AI-generated podcast/paper summaries only
+                          (also included automatically under 'all')
                         - 'documents' for all document collections
                         - a specific collection name (e.g. 'papers', 'books')
                         - 'all' for everything (default)
@@ -871,11 +892,14 @@ class Tools:
                        - 'published' (default) — article/episode publication date
                        - 'indexed' — when the item was added/saved to the knowledgebase
             tag: Optional tag label to restrict results to (exact match, case-insensitive).
-                 Only applies to Wallabag articles, RSS feed articles, and podcasts.
-                 Use get_articles_by_tag() instead when you need a complete listing.
+                 Applies to Wallabag articles, RSS feed articles, podcasts, and AI-generated
+                 summaries. Use get_articles_by_tag() instead when you need a complete listing.
 
         Returns:
-            Relevant context from the knowledge base, formatted with source information
+            Relevant context from the knowledge base, formatted with source information.
+            NOTE: Results labeled as an AI-generated summary are a recall aid, not the
+            source itself — never cite their wording as fact; fetch the real content via
+            get_full_document() using the result's Source file/Source type fields first.
         """
         from qdrant_client import QdrantClient
         from openai import OpenAI
@@ -912,6 +936,8 @@ class Tools:
                 collections.append(self.valves.FEEDS_COLLECTION)
             if collection in ["kindle", "all"]:
                 collections.append(self.valves.KINDLE_COLLECTION)
+            if collection in ["summaries", "all"]:
+                collections.append(self.valves.SUMMARIES_COLLECTION)
 
             doc_names = self._get_document_collection_names()
 
@@ -921,7 +947,7 @@ class Tools:
                 collections.append(collection)
 
             if not collections:
-                valid = ["articles", "podcasts", "feeds", "kindle", "documents", "all"] + doc_names
+                valid = ["articles", "podcasts", "feeds", "kindle", "summaries", "documents", "all"] + doc_names
                 return f"Unknown collection: {collection}. Valid options: {', '.join(valid)}"
 
             from qdrant_client.models import Filter as QFilter
@@ -1062,6 +1088,33 @@ class Tools:
                     )
                     if payload.get('location_url'):
                         header += f"\nKindle Link: {payload['location_url']}"
+                elif source == "summary":
+                    summary_type = payload.get("source_type", "unknown")
+                    if summary_type == "podcast":
+                        header = (
+                            f"**AI Summary — Podcast: {payload.get('show_name', 'Unknown Show')}**\n"
+                            f"Episode: {payload.get('episode_name', 'Unknown Episode')}"
+                        )
+                    elif summary_type == "paper":
+                        header = f"**AI Summary — Paper: {payload.get('document_name', 'Unknown Document')}**"
+                    else:
+                        header = f"**AI Summary: {payload.get('title', 'Untitled')}**"
+                    if payload.get('title'):
+                        header += f"\nTitle: {payload['title']}"
+                    if payload.get('url'):
+                        header += f"\nURL: {payload['url']}"
+                    if payload.get('tags'):
+                        header += f"\nTags: {', '.join(payload['tags'])}"
+                    header += f"\nSource type: {summary_type}"
+                    if payload.get('source_file'):
+                        header += f"\nSource file: {payload['source_file']}"
+                    header += (
+                        "\nNOTE: This is an AI-generated SUMMARY, not the original source — written "
+                        "purely to aid semantic search recall. Do not cite its wording as fact. Before "
+                        "presenting specifics, fetch the real content with get_full_document(file_path="
+                        "<Source file above>, source_type=<Source type above>), or search the full "
+                        "transcript/paper collection instead."
+                    )
                 else:
                     collection_name = getattr(r, '_collection_name', source)
                     doc_name = payload.get('document_name', payload.get('title', 'Unknown Document'))

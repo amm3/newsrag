@@ -67,8 +67,9 @@ A personal RAG system for indexing Wallabag articles, podcast transcripts, resea
 - **Qdrant on dedicated server** - GPU proximity for future local embedding experiments
 - **Storage on NVMe** - Low latency for vector operations
 - **OpenAI `text-embedding-3-small`** - Best cost/quality ratio at $0.02/1M tokens
-- **Separate collections** - `wallabag_articles`, `podcast_transcripts`, `papers`, `news_feeds`, `kindle_highlights`
+- **Separate collections** - `wallabag_articles`, `podcast_transcripts`, `papers`, `summaries`, `news_feeds`, `kindle_highlights`
 - **OpenWebUI unchanged** - Qdrant accessed via custom Tool, not replacing ChromaDB
+- **AI summaries as a two-phase pipeline** - `summarize` (LLM call, writes `.ai-summary.md` next to the source file) is decoupled from `summaries` (embeds/loads into Qdrant), so a hand-edited summary reloads without regenerating it. Not yet wired into the OpenWebUI Tool — see [AI Summaries](#ai-summaries)
 
 ---
 
@@ -225,6 +226,46 @@ Use the `run.sh` wrapper script, which activates the venv automatically:
 ./run.sh papers --files /path/to/doc.pdf /path/to/other.txt -v
 ```
 
+### AI Summaries
+
+Two-phase pipeline that generates AI summaries for podcast transcripts and
+papers (not Wallabag articles) and indexes them in their own `summaries`
+collection.
+
+**Phase 1 — generate.** For each transcript/paper without a summary yet,
+writes a sibling `<name>.ai-summary.md` file next to it (e.g.
+`Episode.txt` → `Episode.ai-summary.md`), with a `key: value` header
+(`title`, `url`, `published_at`, `tags`, `source_file`, `generated_at`,
+`model`) followed by the LLM-generated summary body. This step never
+touches Qdrant, and never overwrites an existing `.ai-summary.md` file
+unless you pass `--regenerate` or `--files` — so you can hand-edit a
+summary and it's safe from routine re-runs.
+
+**Phase 2 — load.** Scans for `.ai-summary.md` files and embeds/upserts
+them into the `summaries` collection, tagged with `source_type` (`podcast`
+or `paper`). Re-running after you hand-edit a summary picks up the change
+automatically via the same mtime-based incremental sync every other loader
+uses.
+
+```bash
+# Phase 1: generate summaries (costs an LLM call per new file)
+./run.sh summarize --type podcast --podcast-dir /path/to/podcasts -v
+./run.sh summarize --type paper --papers-dir /path/to/papers -v
+
+# Force-regenerate summaries that already exist
+./run.sh summarize --type podcast --podcast-dir /path/to/podcasts --regenerate -v
+
+# Regenerate specific source files
+./run.sh summarize --type paper --files /path/to/paper.md -v
+
+# Phase 2: embed and load summaries into Qdrant (cheap — embeddings only)
+./run.sh summaries --podcast-dir /path/to/podcasts --papers-dir /path/to/papers -v
+
+# Dry runs work for both phases
+./run.sh summarize --type podcast --podcast-dir /path/to/podcasts --dry-run -v
+./run.sh summaries --podcast-dir /path/to/podcasts --papers-dir /path/to/papers --dry-run -v
+```
+
 ### RSS/Atom News Feeds
 
 Requires `config/feeds.yaml` (see [Configuration](#configuration)).
@@ -299,6 +340,7 @@ Incremental sync state is stored in `config/`:
 - `.wallabag_sync_state.json`
 - `.podcast_sync_state.json`
 - `.papers_sync_state.json`
+- `.summaries_sync_state.json`
 - `.feeds_sync_state.json`
 - `.kindle_sync_state.json`
 - `.openwebui_sync_state.json`
@@ -512,6 +554,8 @@ qdrant_loader/
     ├── wallabag_ingest.py    # Wallabag article ingestion
     ├── podcast_ingest.py     # Podcast transcript ingestion
     ├── papers_ingest.py      # Papers/document ingestion
+    ├── summarize.py          # AI summary generation (Phase 1, no Qdrant writes)
+    ├── summaries_ingest.py   # AI summary ingestion into Qdrant (Phase 2)
     ├── feeds_ingest.py       # RSS/Atom feed ingestion
     ├── kindle_ingest.py      # Kindle highlights ingestion
     └── openwebui_tool.py     # OpenWebUI Tool code
@@ -527,6 +571,11 @@ With typical usage across all sources:
 
 OpenAI `text-embedding-3-small` pricing: $0.02 per 1M tokens
 
+AI summary generation (`./run.sh summarize`) additionally makes one chat-completion
+call per file, at `SUMMARY_MODEL` pricing — check current OpenAI pricing before
+running it over a large backlog. Loading summaries into Qdrant (`./run.sh summaries`)
+is embeddings-only and costs the same negligible amount as any other incremental sync.
+
 ---
 
-*Last updated: February 2026*
+*Last updated: August 2026*
