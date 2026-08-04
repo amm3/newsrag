@@ -32,7 +32,7 @@ source_file + source_type) before citing specifics.
 title: Qdrant Knowledge Search
 author: adam
 description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, RSS/Atom feeds, Kindle highlights, and AI-generated summaries)
-version: 1.7.0
+version: 1.8.0
 """
 
 from typing import Callable
@@ -121,6 +121,18 @@ class Tools:
             default="rerank-english-v3.0",
             description="Cohere rerank model to use"
         )
+        ANALYZE_TWITTER_IMAGES: bool = Field(
+            default=True,
+            description="Automatically describe images attached to x.com/twitter.com articles in get_full_article using vision"
+        )
+        VISION_MODEL: str = Field(
+            default="gpt-4o-mini",
+            description="OpenAI vision-capable model used to describe images attached to X/Twitter articles"
+        )
+        MAX_IMAGES_TO_ANALYZE: int = Field(
+            default=3,
+            description="Maximum number of attached images to run through vision analysis per get_full_article call"
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -167,6 +179,40 @@ class Tools:
         self._wallabag_token_expires = time.time() + data.get('expires_in', 3600) - 60
         return self._wallabag_token
 
+    def _describe_image(self, image_url: str) -> str | None:
+        """Describe an image with vision. Returns None on any failure (missing key,
+        network error, rate limit, model error) so a vision failure never breaks
+        the caller's larger response."""
+        if not self.valves.OPENAI_API_KEY:
+            return None
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.valves.OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model=self.valves.VISION_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "This image was attached to a post saved from X (Twitter). "
+                                "Describe exactly what it shows. If it is a screenshot of "
+                                "another post, tweet, or article, transcribe the visible text "
+                                "as accurately as possible, including the author's name or "
+                                "handle if visible. If it is a photo, chart, or meme, describe "
+                                "it concisely."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }],
+                max_tokens=350,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return None
+
     async def get_full_article(
         self,
         article_id: int,
@@ -211,8 +257,23 @@ class Tools:
             
             title = article.get('title', 'Untitled')
             content = article.get('content', '')
-            
-            # Convert HTML links to markdown links, then strip remaining HTML tags
+            domain = article.get('domain_name', '')
+
+            # Convert images to markdown image syntax (so screenshots embedded in
+            # articles, e.g. saved tweets, remain visible as links), then convert
+            # HTML links to markdown links, then strip remaining HTML tags
+            def _markdown_image(match):
+                tag = match.group(0)
+                src_match = re.search(r'src=["\']([^"\']*)["\']', tag, re.IGNORECASE)
+                if not src_match:
+                    return ''
+                src = html.unescape(src_match.group(1))
+                if src.startswith('data:'):
+                    return ''
+                alt_match = re.search(r'alt=["\']([^"\']*)["\']', tag, re.IGNORECASE)
+                alt = html.unescape(alt_match.group(1)).strip() if alt_match else ''
+                return f"![{alt}]({src})"
+
             def _markdown_link(match):
                 href = html.unescape(match.group(1))
                 text = re.sub(r'<[^>]+>', '', match.group(2))
@@ -221,17 +282,39 @@ class Tools:
                     return href
                 return f"[{text}]({href})"
 
+            clean_content = re.sub(r'<img\b[^>]*>', _markdown_image, content, flags=re.IGNORECASE)
             clean_content = re.sub(
                 r'<a\s+[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>',
                 _markdown_link,
-                content,
+                clean_content,
                 flags=re.IGNORECASE | re.DOTALL,
             )
             clean_content = re.sub(r'<[^>]+>', '', clean_content)
             clean_content = html.unescape(clean_content)
             clean_content = re.sub(r'\s+', ' ', clean_content).strip()
-            
-            domain = article.get('domain_name', '')
+
+            # For X/Twitter articles, describe attached media images with vision so
+            # screenshot-based quote-tweets (a screenshot of another post, rather than
+            # a native in-platform quote-tweet with real text) aren't opaque to the LLM
+            if self.valves.ANALYZE_TWITTER_IMAGES and domain.lower() in ('x.com', 'twitter.com'):
+                analyzed_count = 0
+
+                def _annotate_twitter_image(match):
+                    nonlocal analyzed_count
+                    if analyzed_count >= self.valves.MAX_IMAGES_TO_ANALYZE:
+                        return match.group(0)
+                    analyzed_count += 1
+                    description = self._describe_image(match.group(2))
+                    if not description:
+                        return match.group(0)
+                    return f'{match.group(0)} [Image shows: "{description}"]'
+
+                clean_content = re.sub(
+                    r'!\[([^\]]*)\]\((https?://pbs\.twimg\.com/media/[^\)]+)\)',
+                    _annotate_twitter_image,
+                    clean_content,
+                )
+
             article_url = article.get('url', '')
             reading_time = article.get('reading_time', 0)
             tags = [t['label'] for t in article.get('tags', [])]

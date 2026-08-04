@@ -19,6 +19,7 @@ Fetch the complete text of a Wallabag article by its ID.
 
 - **When to use**: After `search_knowledge` returns relevant snippets from a Wallabag article and the user wants the full content for deeper reading or summarization.
 - **Parameters**: An integer `article_id` (obtained from `search_knowledge` results).
+- **Images**: Embedded images are preserved as markdown (`![alt](src)`). For articles from `x.com`/`twitter.com`, any attached media image is automatically described with vision and annotated inline as `[Image shows: "..."]` — this covers screenshot-based quote-tweets (a screenshot of another post rather than a native in-platform quote-tweet with real text), photos, charts, and memes attached to the tweet. Treat this as you would any AI-derived content (see Edge Cases).
 
 ### `list_wallabag_tags`
 List all tags used in Wallabag, sorted alphabetically, with article counts per tag (when the Wallabag instance supports it, v2.5.2+).
@@ -67,7 +68,10 @@ Key settings that must be configured for the tool to work:
 
 - **QDRANT_URL** — Qdrant server address (default: `http://host.docker.internal:6333`)
 - **QDRANT_API_KEY** — Qdrant API key if authentication is enabled
-- **OPENAI_API_KEY** — Required for generating query embeddings via `text-embedding-3-small`
+- **OPENAI_API_KEY** — Required for generating query embeddings via `text-embedding-3-small`, and reused by `get_full_article` for vision analysis of X/Twitter images
+- **ANALYZE_TWITTER_IMAGES** (default: `true`) — Automatically describe images attached to x.com/twitter.com articles in `get_full_article` using vision
+- **VISION_MODEL** (default: `gpt-4o-mini`) — OpenAI vision-capable model used to describe X/Twitter images
+- **MAX_IMAGES_TO_ANALYZE** (default: 3) — Maximum number of attached images to run through vision analysis per `get_full_article` call
 - **TOP_K** (default: 8) — Total number of results to return
 - **PER_ARTICLE_MAX** (default: 2) — Preferred max results from any single article/episode, to keep results diverse
 - **WALLABAG_COLLECTION** / **PODCAST_COLLECTION** / **FEEDS_COLLECTION** / **KINDLE_COLLECTION** / **SUMMARIES_COLLECTION** — Qdrant collection names for Wallabag, podcasts, RSS/Atom feeds, Kindle highlights, and AI-generated summaries (defaults: `wallabag_articles`, `podcast_transcripts`, `news_feeds`, `kindle_highlights`, `summaries`)
@@ -173,3 +177,4 @@ The `summaries` collection (folded into `collection="all"`) holds AI-generated s
 - Document results depend on the quality of the .md/.txt conversion from the original format. Some converted documents may have formatting artifacts.
 - AI-generated summaries synthesize themes conceptually rather than recapping verbatim — they may use terminology the original source never used. This is intentional (it's what makes them useful for recall), but their wording should never be quoted as if it were the source's own words.
 - **Important**: When calling `get_full_document`, use the raw `file_path` value from search result metadata — the path with normal spaces and characters (e.g., `Show Name/Episode.txt`). Do NOT copy the path from a Transcript or Audio URL, as those are URL-encoded (e.g., `Show%20Name/Episode.txt`) and will cause a 404 error due to double-encoding.
+- Vision-generated `[Image shows: "..."]` annotations in `get_full_article` (for X/Twitter images) are AI-derived, not guaranteed verbatim — treat any transcribed quote text as paraphrase-accurate rather than pixel-perfect when precision matters. If vision analysis fails or is disabled, the image still appears as a plain `![alt](src)` markdown link with no annotation.
