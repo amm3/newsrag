@@ -3,7 +3,17 @@
 wallabag_ingest.py - Ingest Wallabag articles into Qdrant
 
 Fetches articles from Wallabag API, chunks them, generates embeddings,
-and upserts to Qdrant with deduplication based on article ID.
+and upserts to Qdrant with deduplication based on article ID. Each
+article's highlights and notes (annotations) are indexed as their own
+searchable points alongside the body chunks.
+
+Annotations are (re)indexed whenever their article is reprocessed. If you
+add/edit an annotation without changing the article body itself, it may not
+be picked up by an incremental (`since`-based) sync until Wallabag bumps the
+entry's updated_at. Use `--entries <id>` to force a refresh for a specific
+article, `--annotated-only` to reprocess every article that currently has
+annotations (cheap way to catch all of them without a full resync), or
+`--full` to force a full re-sync.
 """
 
 import sys
@@ -42,6 +52,9 @@ def main():
     sync_mode.add_argument("--full", action="store_true", help="Full re-sync (ignore state)")
     sync_mode.add_argument("--entries", type=int, nargs='+', metavar='ID',
                            help="Reprocess specific Wallabag entry IDs")
+    sync_mode.add_argument("--annotated-only", action="store_true",
+                           help="Reprocess only entries that currently have annotations "
+                                "(requires Wallabag >= 2.6.14; ignores --full/incremental state)")
     parser.add_argument("--dry-run", action="store_true", help="Don't write to Qdrant")
     args = parser.parse_args()
 
@@ -105,6 +118,11 @@ def main():
             except Exception as e:
                 logging.error(f"Failed to fetch entry {entry_id}: {e}")
         logging.info(f"Retrieved {len(articles)} of {len(args.entries)} requested entries")
+    elif args.annotated_only:
+        _check_annotations_filter_support(wallabag)
+        logging.info("Fetching entries with annotations from Wallabag...")
+        articles = wallabag.get_entries(annotations=True)
+        logging.info(f"Found {len(articles)} annotated articles to process")
     else:
         last_sync = None
         if not args.full and state_file.exists():
@@ -123,23 +141,31 @@ def main():
 
     # Process articles
     total_chunks = 0
+    total_annotations = 0
     for i, article in enumerate(articles, 1):
         try:
-            chunks = process_article(
+            chunks, annotation_count = process_article(
                 article, openai_client, qdrant, collection_name,
-                chunk_size, chunk_overlap, embedding_model, args.dry_run
+                chunk_size, chunk_overlap, embedding_model, wallabag, args.dry_run
             )
             total_chunks += chunks
-            logging.info(f"[{i}/{len(articles)}] Processed: {article['title'][:50]}... ({chunks} chunks)")
+            total_annotations += annotation_count
+            logging.info(
+                f"[{i}/{len(articles)}] Processed: {article['title'][:50]}... "
+                f"({chunks} chunks, {annotation_count} annotations)"
+            )
         except Exception as e:
             logging.error(f"Failed to process article {article.get('id')}: {e}")
 
     # Save state (skip for targeted reprocessing)
-    if not args.dry_run and not args.entries:
+    if not args.dry_run and not args.entries and not args.annotated_only:
         with open(state_file, 'w') as f:
             json.dump({'last_sync': datetime.now(timezone.utc).isoformat()}, f)
 
-    logging.warning(f"Completed: {len(articles)} articles, {total_chunks} chunks indexed")
+    logging.warning(
+        f"Completed: {len(articles)} articles, {total_chunks} chunks, "
+        f"{total_annotations} annotations indexed"
+    )
     return 0
 
 
@@ -175,8 +201,9 @@ class WallabagClient:
         self.token_expires = time.time() + data.get('expires_in', 3600) - 60
         return self.token
 
-    def get_entries(self, since=None, per_page=30):
-        """Fetch all entries, optionally since a timestamp"""
+    def get_entries(self, since=None, per_page=30, annotations=None):
+        """Fetch all entries, optionally since a timestamp and/or filtered to
+        those that currently have annotations"""
         token = self._get_token()
         headers = {'Authorization': f'Bearer {token}'}
 
@@ -188,6 +215,8 @@ class WallabagClient:
             if since:
                 # Wallabag uses 'since' as Unix timestamp
                 params['since'] = int(datetime.fromisoformat(since.replace('Z', '+00:00')).timestamp())
+            if annotations is not None:
+                params['annotations'] = 1 if annotations else 0
 
             logging.debug(f"Fetching page {page} from Wallabag API")
             resp = requests.get(f"{self.url}/api/entries.json",
@@ -217,6 +246,44 @@ class WallabagClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_annotations(self, entry_id: int) -> list[dict]:
+        """Fetch annotations (highlights + notes) for a single entry"""
+        token = self._get_token()
+        headers = {'Authorization': f'Bearer {token}'}
+        resp = requests.get(f"{self.url}/api/annotations/{entry_id}.json",
+                            headers=headers)
+        resp.raise_for_status()
+        return resp.json().get('rows', [])
+
+    def get_version(self) -> str:
+        """Fetch the Wallabag server version (public endpoint, no auth needed)"""
+        resp = requests.get(f"{self.url}/api/version.json")
+        resp.raise_for_status()
+        return resp.json()
+
+
+MIN_ANNOTATIONS_FILTER_VERSION = (2, 6, 14)
+
+
+def _check_annotations_filter_support(wallabag: 'WallabagClient'):
+    """Best-effort warning if the server predates Wallabag's `annotations`
+    entries filter (added in 2.6.14, wallabag/wallabag#8346). On an older
+    server the filter is silently ignored and /api/entries.json?annotations=1
+    returns the FULL unfiltered entry list instead of just annotated ones.
+    """
+    try:
+        version = wallabag.get_version()
+        match = re.match(r'(\d+)\.(\d+)\.(\d+)', version or '')
+        if match and tuple(int(g) for g in match.groups()) < MIN_ANNOTATIONS_FILTER_VERSION:
+            logging.warning(
+                f"Wallabag server reports version {version}, older than 2.6.14 — the "
+                f"'annotations' entries filter may not be supported. --annotated-only "
+                f"could silently reprocess your ENTIRE library instead of just annotated "
+                f"articles. Verify with: curl {wallabag.url}/api/entries.json?annotations=1"
+            )
+    except Exception as e:
+        logging.debug(f"Could not verify Wallabag version for annotations-filter support: {e}")
+
 
 def ensure_collection(client: QdrantClient, collection_name: str, dimensions: int = 1536):
     """Create collection if it doesn't exist"""
@@ -243,6 +310,15 @@ def ensure_collection(client: QdrantClient, collection_name: str, dimensions: in
         logging.debug("Ensured payload index on is_starred")
     except Exception as e:
         logging.debug(f"Payload index on is_starred already exists or failed: {e}")
+    try:
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name='chunk_type',
+            field_schema=PayloadSchemaType.KEYWORD
+        )
+        logging.debug("Ensured payload index on chunk_type")
+    except Exception as e:
+        logging.debug(f"Payload index on chunk_type already exists or failed: {e}")
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -283,11 +359,63 @@ def get_embeddings(texts: list[str], client: OpenAI, model: str) -> list[list[fl
     return [item.embedding for item in response.data]
 
 
+def _article_payload_base(article: dict) -> dict:
+    """Fields shared by every point (body chunk or annotation) for one article."""
+    return {
+        'article_id': article['id'],
+        'title': article.get('title', 'Untitled'),
+        'url': article.get('url', ''),
+        'domain': article.get('domain_name', ''),
+        'reading_time': article.get('reading_time', 0),
+        'created_at': article.get('created_at', ''),
+        'updated_at': article.get('updated_at', ''),
+        'published_at': article.get('published_at', ''),
+        'tags': [t['label'] for t in article.get('tags', [])],
+        'published_by': article.get('published_by', []),
+        'source': 'wallabag',
+        'is_starred': bool(article.get('is_starred', 0)),
+        'starred_at': article.get('starred_at'),
+    }
+
+
+def _build_annotation_items(article_id: int, annotations: list[dict]) -> list[tuple[str, str, dict]]:
+    """Build (point_id, embed_text, extra_payload) tuples for one article's
+    annotations, skipping any with neither a usable quote nor note.
+    """
+    items = []
+    for idx, ann in enumerate(annotations):
+        quote = (ann.get('quote') or '').strip()
+        note = (ann.get('text') or '').strip()
+
+        if not quote and not note:
+            continue
+
+        embed_text = f"{quote}\n\nNote: {note}" if quote and note else (quote or note)
+
+        annotation_id = ann.get('id')
+        if annotation_id is None:
+            annotation_id = idx
+        point_id = hashlib.md5(f"{article_id}_annotation_{annotation_id}".encode()).hexdigest()
+
+        items.append((point_id, embed_text, {
+            'chunk_type': 'annotation',
+            'annotation_id': annotation_id,
+            'quote': quote,
+            'note': note,
+            'text': embed_text,
+        }))
+
+    return items
+
+
 def process_article(article: dict, openai_client: OpenAI,
                    qdrant: QdrantClient, collection_name: str,
                    chunk_size: int, chunk_overlap: int, embedding_model: str,
-                   dry_run: bool = False) -> int:
-    """Process a single article: chunk, embed, upsert"""
+                   wallabag: 'WallabagClient', dry_run: bool = False) -> tuple[int, int]:
+    """Process a single article: chunk body + annotations, embed, upsert.
+
+    Returns (body_chunk_count, annotation_count).
+    """
 
     article_id = article['id']
     title = article.get('title', 'Untitled')
@@ -297,63 +425,82 @@ def process_article(article: dict, openai_client: OpenAI,
     clean_content = re.sub(r'<[^>]+>', '', content)
     clean_content = re.sub(r'\s+', ' ', clean_content).strip()
 
-    if not clean_content:
-        logging.debug(f"Skipping article {article_id}: no content")
-        return 0
+    # Fetch annotations (highlights + notes). Best-effort: a failure here
+    # degrades to zero annotations rather than aborting article processing.
+    try:
+        annotations = wallabag.get_annotations(article_id)
+    except Exception as e:
+        logging.warning(f"Failed to fetch annotations for article {article_id}: {e}")
+        annotations = []
+    annotation_items = _build_annotation_items(article_id, annotations)
 
-    # Delete existing chunks for this article (for updates)
+    if not clean_content and not annotation_items:
+        logging.debug(f"Skipping article {article_id}: no content and no annotations")
+        return 0, 0
+
+    # Delete existing points for this article (for updates). If the body
+    # came back empty this run (e.g. a transient extraction hiccup) but
+    # annotations exist, only clear out stale annotation points rather than
+    # wiping previously-indexed body chunks that are still good.
     if not dry_run:
         try:
-            qdrant.delete(
-                collection_name=collection_name,
-                points_selector=Filter(
-                    must=[FieldCondition(key='article_id', match=MatchValue(value=article_id))]
+            if clean_content:
+                qdrant.delete(
+                    collection_name=collection_name,
+                    points_selector=Filter(
+                        must=[FieldCondition(key='article_id', match=MatchValue(value=article_id))]
+                    )
                 )
-            )
+            else:
+                qdrant.delete(
+                    collection_name=collection_name,
+                    points_selector=Filter(must=[
+                        FieldCondition(key='article_id', match=MatchValue(value=article_id)),
+                        FieldCondition(key='chunk_type', match=MatchValue(value='annotation')),
+                    ])
+                )
         except Exception as e:
             logging.debug(f"Delete failed (may not exist): {e}")
 
     # Chunk the content
-    chunks = chunk_text(f"{title}\n\n{clean_content}", chunk_size, chunk_overlap)
+    chunks = chunk_text(f"{title}\n\n{clean_content}", chunk_size, chunk_overlap) if clean_content else []
 
-    if not chunks:
-        return 0
+    # Batch body-chunk and annotation texts into a single embeddings call
+    annotation_texts = [t for _, t, _ in annotation_items]
+    texts_to_embed = chunks + annotation_texts
 
-    # Generate embeddings
-    embeddings = get_embeddings(chunks, openai_client, embedding_model)
+    if not texts_to_embed:
+        return 0, 0
 
-    # Create points
+    embeddings = get_embeddings(texts_to_embed, openai_client, embedding_model)
+    chunk_embeddings = embeddings[:len(chunks)]
+    annotation_embeddings = embeddings[len(chunks):]
+
+    base_payload = _article_payload_base(article)
+
+    # Create body chunk points
     points = []
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+    for i, (chunk, embedding) in enumerate(zip(chunks, chunk_embeddings)):
         point_id = hashlib.md5(f"{article_id}_{i}".encode()).hexdigest()
-
         points.append(PointStruct(
             id=point_id,
             vector=embedding,
-            payload={
-                'article_id': article_id,
-                'chunk_index': i,
-                'title': title,
-                'text': chunk,
-                'url': article.get('url', ''),
-                'domain': article.get('domain_name', ''),
-                'reading_time': article.get('reading_time', 0),
-                'created_at': article.get('created_at', ''),
-                'updated_at': article.get('updated_at', ''),
-                'published_at': article.get('published_at', ''),
-                'tags': [t['label'] for t in article.get('tags', [])],
-                'published_by': article.get('published_by', []),
-                'source': 'wallabag',
-                'is_starred': bool(article.get('is_starred', 0)),
-                'starred_at': article.get('starred_at')
-            }
+            payload={**base_payload, 'chunk_type': 'body', 'chunk_index': i, 'text': chunk}
+        ))
+
+    # Create annotation points
+    for (point_id, _, extra_payload), embedding in zip(annotation_items, annotation_embeddings):
+        points.append(PointStruct(
+            id=point_id,
+            vector=embedding,
+            payload={**base_payload, **extra_payload}
         ))
 
     # Upsert to Qdrant
     if not dry_run:
         qdrant.upsert(collection_name=collection_name, points=points)
 
-    return len(points)
+    return len(chunks), len(annotation_items)
 
 
 def log_fatal(msg, exit_code=-1):

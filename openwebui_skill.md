@@ -14,12 +14,24 @@ Search a personal knowledge base of saved Wallabag articles, podcast transcripts
   - `date_mode` — Which date concept to filter on: `"published"` (default) for article/episode publication date; `"indexed"` for when the item was added/saved to the knowledgebase. The tool resolves the correct payload field per collection internally.
   - `tag` — Optional tag label to restrict results to (exact match, case-insensitive). Only filters Wallabag articles, RSS feed articles, podcasts, and AI-generated summaries; Kindle and document collections are unaffected. Use `get_articles_by_tag()` instead when you need a **complete listing** of all articles with a tag rather than a semantic top-K.
 
+### `list_recent_feed_articles`
+List every RSS/Atom feed article published in a time window — complete and deduplicated, with no ranking, categorization, or summarization applied.
+
+- **When to use**: When you need an exhaustive inventory of feed articles for a time range (e.g. building a daily news roundup, or any downstream pipeline like an n8n workflow that does its own categorization/summarization) rather than a relevance-ranked subset. Use this instead of `search_knowledge` whenever completeness matters more than relevance — it's a plain Qdrant payload listing (no query embedding, no OpenAI call).
+- **Parameters**:
+  - `days` — How many days back from today (UTC) to include, e.g. `1` means today and yesterday. Ignored if `date_from` or `date_to` is set. Default `1`.
+  - `date_from` — Optional explicit start of the window, ISO format (`YYYY-MM-DD`). Overrides `days` when set.
+  - `date_to` — Optional explicit end of the window, ISO format (`YYYY-MM-DD`). Overrides `days` when set.
+  - `feed_name` — Optional feed name to restrict results to (exact match, case-sensitive). Omit for all feeds.
+- **Notes**: Articles are chunked at ingest time; this tool collapses each article's chunks down to a single entry (using the chunk with the title prepended), so you always get one row per article, never one per chunk. Results are sorted newest first and are uncapped — no `TOP_K`-style truncation — aside from an internal safety cap (20,000 raw chunk points scanned) that only exists to bound worst-case memory/latency on a badly misconfigured date range; it will not affect normal daily-window usage. Does not fetch full article text, categorize, cluster, or summarize — only title, feed name, URL, published date, author, tags, and the article's opening text (~1000 chars).
+
 ### `get_full_article`
 Fetch the complete text of a Wallabag article by its ID.
 
 - **When to use**: After `search_knowledge` returns relevant snippets from a Wallabag article and the user wants the full content for deeper reading or summarization.
 - **Parameters**: An integer `article_id` (obtained from `search_knowledge` results).
 - **Images**: Embedded images are preserved as markdown (`![alt](src)`). For articles from `x.com`/`twitter.com`, any attached media image is automatically described with vision and annotated inline as `[Image shows: "..."]` — this covers screenshot-based quote-tweets (a screenshot of another post rather than a native in-platform quote-tweet with real text), photos, charts, and memes attached to the tweet. Treat this as you would any AI-derived content (see Edge Cases).
+- **Annotations**: If the user highlighted passages in Wallabag (with or without an attached note), those appear in a "Your Annotations" section after the article body — each as the quoted passage plus, if present, a `Note:` line. Missing when the article has no annotations.
 
 ### `list_wallabag_tags`
 List all tags used in Wallabag, sorted alphabetically, with article counts per tag (when the Wallabag instance supports it, v2.5.2+).
@@ -53,6 +65,17 @@ Remove a single tag from a Wallabag article.
   - `tag` — The tag label to remove (e.g. `"ai"`). One tag per call. Case-insensitive.
 - **Notes**: Only removes the named tag — all other tags are left unchanged. Returns an error (with the current tag list) if the tag is not present on the article. The response confirms the article title and shows the remaining tags after removal.
 
+### `update_article_status`
+Mark one or more Wallabag articles read/unread and/or starred/unstarred.
+
+- **When to use**: **ONLY** when the user explicitly tells you to mark an article read/unread, or to star/unstar it. Never call this proactively, and never as a side-effect of searching, fetching, or summarizing — reading an article's content in chat does not mean the user wants it marked read in Wallabag.
+- **Parameters**:
+  - `article_ids` — One integer Wallabag article ID, or several separated by commas (e.g. `"412"` or `"412,413,414"`), up to 50 per call.
+  - `read` — `true` marks the article(s) read, `false` marks them unread. Omit to leave read state untouched.
+  - `starred` — `true` stars the article(s), `false` unstars them. Omit to leave star state untouched.
+  - At least one of `read` or `starred` must be given; both can be set in the same call, applied to every ID in `article_ids`.
+- **Notes**: "Read" in Wallabag is the *archived* state — `read=true` archives the article (clears it from the unread list), `read=false` returns it to unread. There is no separate archive concept to worry about. Each ID is updated independently, so one bad ID (deleted, mistyped) doesn't block the rest of the batch — the response lists successes and failures separately, each with the article's resulting state (e.g. `read · starred`) taken from Wallabag's response, not just echoed back from the request.
+
 ### `get_full_document`
 Fetch the full text of a document or podcast transcript from the static file server.
 
@@ -61,6 +84,12 @@ Fetch the full text of a document or podcast transcript from the static file ser
   - `file_path` — The relative file path from search results (e.g., `"paper_name.md"` or `"ShowName/Episode.txt"`). Use the raw path with normal spaces — do NOT use URL-encoded paths from transcript/audio URLs.
   - `source_type` — The **collection name** from search results (the `Collection` field, e.g. `"papers"`, `"books"`). For podcasts use `"podcasts"`. The collection name determines the folder in the URL. Default: `"papers"`.
   - For AI-generated summary results specifically, use the result's own `Source file` and `Source type` fields directly (`source_type` will be `"podcast"` or `"paper"`) — these resolve the same way podcast/document source types already do, no translation needed.
+
+### `get_kindle_highlights`
+Fetch every saved highlight and annotation for a specific Kindle book.
+
+- **When to use**: After `search_knowledge` returns a Kindle highlight snippet and the user wants the complete set of highlights from that book, not just the top semantic matches. This returns highlighted passages and personal annotations only — **not** the book's full text.
+- **Parameters**: A `file_name` — the Kindle highlights JSON filename from search results (the `File` field on a Kindle result).
 
 ## Configuration (Valves)
 
@@ -78,7 +107,8 @@ Key settings that must be configured for the tool to work:
 - **DOCUMENT_COLLECTIONS** — Comma-separated Qdrant collection names for document collections (e.g., `"papers,books,manuals"`)
 - **DOCUMENT_COLLECTIONS_BASE_URL** — Base URL for document collections; files are served at `{base_url}/{collection_name}/...` (default: `https://static-lan.maddock.net`)
 - **PODCASTS_BASE_URL** — Base URL for podcast files on the static file server (default: `https://static-lan.maddock.net/podcasts`)
-- **Wallabag credentials** (URL, client ID, client secret, username, password) — Required for `get_full_article`, `list_wallabag_tags`, and `get_articles_by_tag`
+- **KINDLE_HIGHLIGHTS_BASE_URL** — Base URL for Kindle highlight JSON files on the static file server, used by `get_kindle_highlights` (default: `https://static-lan.maddock.net/kindle_highlights`)
+- **Wallabag credentials** (URL, client ID, client secret, username, password) — Required for `get_full_article`, `list_wallabag_tags`, `get_articles_by_tag`, and `update_article_status`
 
 ## Usage Patterns
 
@@ -105,6 +135,7 @@ If a search snippet is promising but incomplete:
 - **For Wallabag articles**: Note the `Article ID` from the search results, then call `get_full_article` with that ID.
 - **For documents or podcasts**: Note the `File` path and `Collection` name from the search results, then call `get_full_document` with that `file_path` and the `Collection` value as `source_type`. The collection name determines which folder the file is served from.
 - **For AI-generated summaries**: Note the `Source file` and `Source type` fields from the result (not `File`/`Collection` — a summary points back to a *different* underlying file). Call `get_full_document` with `file_path=<Source file>` and `source_type=<Source type>` to retrieve the actual transcript/paper the summary was generated from. Do this — or re-run `search_knowledge` against the full-text collection — before presenting any specifics from a summary as fact.
+- **For Kindle highlights**: Note the `File` field from a Kindle search result, then call `get_kindle_highlights` with that `file_name` to get every highlight and annotation saved from that book (not the book's full text — just what was highlighted).
 
 ### Exploring saved content by tag
 If the user asks "what tags do I have?" or "what topics have I saved?" or wants to browse their Wallabag by subject:
@@ -144,7 +175,7 @@ If the user asks a broad question like "what have I saved about climate policy":
 
 1. Call `search_knowledge` with a relevant query.
 2. Results are diversified — the tool limits results per article/episode so you get breadth across different sources rather than multiple chunks from the same piece.
-3. If a particular source looks especially relevant, use `get_full_article` (for Wallabag articles) or `get_full_document` (for documents/podcasts) to go deeper.
+3. If a particular source looks especially relevant, use `get_full_article` (for Wallabag articles), `get_full_document` (for documents/podcasts), or `get_kindle_highlights` (for Kindle books) to go deeper.
 
 ### Understanding AI-generated summaries
 The `summaries` collection (folded into `collection="all"`) holds AI-generated synthesis of podcast transcripts and papers — one summary per source file, written to describe themes and concepts rather than recap chronologically. They exist purely to widen semantic search recall: a summary may phrase an idea differently than the original transcript or paper, so a query can surface relevant content even when it shares no exact wording with the source.
@@ -161,11 +192,14 @@ The `summaries` collection (folded into `collection="all"`) holds AI-generated s
 - Wallabag results show: article title, article ID, source domain, URL, and tags.
 - Podcast results show: show name, episode name, transcript URL, and audio URL.
 - Feed results show: article title, feed name, article URL, published date, author, and tags. The article URL links directly to the original source — no `get_full_document` call is needed; direct the user to the URL if they want the full content.
-- Kindle results show: book title, author, location value, and an optional Kindle deep link. Each result is a highlight (annotation) from a Kindle book.
+- Kindle results show: book title, author, location value, an optional Kindle deep link, and the `File` field (the source JSON filename, usable with `get_kindle_highlights`). Each result is a highlight (annotation) from a Kindle book.
 - Document results show: document name, collection name, file path, and a URL to the original file (if a base URL is configured for that collection). The `Collection` field indicates which Qdrant collection the result came from and should be used as the `source_type` when calling `get_full_document`.
 - Summary results show: an explicit "AI Summary" label, podcast (show/episode) or paper (document name) identity, title/URL/tags when available, and the `Source file`/`Source type` needed to fetch the real content. **These are AI-generated synthesis, not the original text — never present their content as fact**; see [Understanding AI-generated summaries](#understanding-ai-generated-summaries).
 - Each result contains a text snippet — the most relevant chunk from the original content.
 - If no results are found, the topic likely wasn't covered in the user's saved content. Say so clearly rather than speculating.
+
+### Citing results
+Every specific article, episode, or document you name in a response must be a markdown link (`[Title](URL)`), not a bare title or a `(Source, Date)` parenthetical — this applies to every item you mention, including ones offered only as corroborating or additional context, not just the ones you quote directly or fetch in full. Build the URL per the result type above: Wallabag → `https://walla.maddock.net/view/{article_id}`; feed articles → the article URL as-is; Kindle → the deep link when available; documents → the document URL when a base URL is configured. Do this yourself in the response text — don't rely on the platform's own citation/footnote panel to surface a source for you, since it doesn't reliably pick up every tool result.
 
 ## Edge Cases
 
@@ -173,6 +207,7 @@ The `summaries` collection (folded into `collection="all"`) holds AI-generated s
 - `get_full_article` and `list_wallabag_tags` require Wallabag credentials to be configured. If they aren't, the tool will return an error.
 - `list_wallabag_tags` may not include article counts on older Wallabag instances (pre-2.5.2); in that case, the list still shows all tag names.
 - `get_full_document` requires `DOCUMENT_COLLECTIONS_BASE_URL` to be configured. If not set, it will return an error for document collections.
+- `search_knowledge` and `get_articles_by_tag` results never include read or starred state — that data isn't indexed in Qdrant. Don't guess whether an article is already read/starred; if it matters, ask the user or just perform the requested `update_article_status` call and let its response (drawn from Wallabag itself) confirm the resulting state.
 - Podcast transcript quality depends on the upstream transcription. Some results may contain transcription artifacts.
 - Document results depend on the quality of the .md/.txt conversion from the original format. Some converted documents may have formatting artifacts.
 - AI-generated summaries synthesize themes conceptually rather than recapping verbatim — they may use terminology the original source never used. This is intentional (it's what makes them useful for recall), but their wording should never be quoted as if it were the source's own words.

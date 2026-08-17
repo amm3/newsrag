@@ -62,6 +62,7 @@ Commands:
 
 Wallabag Options:
   --entries ID [ID ...]  Reprocess specific Wallabag entry IDs
+  --annotated-only       Reprocess only entries that currently have annotations
   --full                 Full re-sync (ignore state file)
   --dry-run              Don't write to Qdrant
   -v                     Verbose output
@@ -133,6 +134,7 @@ OpenWebUI Options:
 Examples:
   ./run.sh wallabag -v
   ./run.sh wallabag --entries 1234 5678 -v
+  ./run.sh wallabag --annotated-only -v
   ./run.sh wallabag --full --dry-run -v
   ./run.sh podcasts --podcast-dir /mnt/nas/podcasts -v
   ./run.sh podcasts --podcast-dir /mnt/nas/podcasts --full -v

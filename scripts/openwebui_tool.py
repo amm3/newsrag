@@ -15,9 +15,21 @@ Usage:
 The LLM can call search_knowledge(query, collection, date_from, date_to, date_mode, tag) to
 retrieve relevant context from your indexed articles, transcripts, document collections,
 feeds, and summaries.
-It can call get_full_article(article_id) to fetch full Wallabag article text,
-or get_full_document(file_path, source_type) to fetch full document/podcast text
-from the static file server.
+It can call get_full_article(article_id) to fetch full Wallabag article text
+plus any Wallabag annotations (highlights and notes) on that article,
+get_full_document(file_path, source_type) to fetch full document/podcast text
+from the static file server, or get_kindle_highlights(file_name) to fetch every
+saved highlight and annotation for a specific Kindle book.
+
+It can call list_recent_feed_articles(days, date_from, date_to, feed_name) to
+retrieve a complete, deduplicated listing of every RSS/Atom feed article in a
+time window — unranked and uncapped, with no categorization or summarization —
+for downstream pipelines (e.g. an n8n daily news roundup) rather than
+relevance search.
+
+It can call update_article_status(article_ids, read, starred) to mark one or
+more Wallabag articles read/unread (archived) and/or starred/unstarred, only
+on explicit user instruction.
 
 Document collections beyond wallabag and podcasts are configurable via the
 DOCUMENT_COLLECTIONS Valve (comma-separated collection names) and
@@ -32,7 +44,7 @@ source_file + source_type) before citing specifics.
 title: Qdrant Knowledge Search
 author: adam
 description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, RSS/Atom feeds, Kindle highlights, and AI-generated summaries)
-version: 1.8.0
+version: 1.12.0
 """
 
 from typing import Callable
@@ -112,6 +124,10 @@ class Tools:
         PODCASTS_BASE_URL: str = Field(
             default="https://static-lan.maddock.net/podcasts",
             description="Base URL for podcast files on the static file server"
+        )
+        KINDLE_HIGHLIGHTS_BASE_URL: str = Field(
+            default="https://static-lan.maddock.net/kindle_highlights",
+            description="Base URL for Kindle highlight JSON files on the static file server"
         )
         COHERE_API_KEY: str = Field(
             default="",
@@ -220,15 +236,18 @@ class Tools:
     ) -> str:
         """
         Fetch the full content of a Wallabag article by its ID.
-        
+
         Use this after search_knowledge returns relevant snippets, when you need
         the complete article text for more detailed analysis or summarization.
-        
+        Any highlighted passages the user annotated in Wallabag, along with any
+        note text attached to them, are appended after the article body.
+
         Args:
             article_id: The Wallabag article ID (from search results payload)
-        
+
         Returns:
-            The full article content with title and metadata
+            The full article content with title, metadata, and the user's
+            annotations (highlights and notes), if any
         """
         import requests
         import re
@@ -254,7 +273,19 @@ class Tools:
             )
             resp.raise_for_status()
             article = resp.json()
-            
+
+            annotations = []
+            try:
+                ann_resp = requests.get(
+                    f"{url}/api/annotations/{article_id}.json",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=30,
+                )
+                ann_resp.raise_for_status()
+                annotations = ann_resp.json().get("rows", [])
+            except requests.exceptions.RequestException:
+                annotations = []
+
             title = article.get('title', 'Untitled')
             content = article.get('content', '')
             domain = article.get('domain_name', '')
@@ -329,7 +360,21 @@ class Tools:
             if published_by:
                 result += f"Author: {', '.join(published_by)}\n"
             result += f"\n---\n\n{clean_content}"
-            
+
+            if annotations:
+                blocks = []
+                for a in annotations:
+                    quote = (a.get("quote") or "").strip()
+                    note = (a.get("text") or "").strip()
+                    block = f"> {quote}" if quote else ""
+                    if note:
+                        block += f"\n\nNote: {note}" if block else f"Note: {note}"
+                    if block:
+                        blocks.append(block)
+                if blocks:
+                    result += f"\n\n---\n\n**Your Annotations ({len(blocks)}):**\n\n"
+                    result += "\n\n---\n\n".join(blocks)
+
             if __event_emitter__:
                 await __event_emitter__({
                     "type": "status",
@@ -692,6 +737,179 @@ class Tools:
                 })
             return error_msg
 
+    @staticmethod
+    def _as_bool(value) -> bool:
+        """Coerce a model-supplied flag to a real bool.
+
+        Tool calls sometimes deliver booleans as strings ("true", "0", "no"),
+        which plain truthiness would read backwards — and reading a read/star
+        flag backwards writes the opposite of what the user asked for.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() not in ('false', '0', 'no', 'none', '')
+
+    async def update_article_status(
+        self,
+        article_ids: str,
+        read: bool = None,
+        starred: bool = None,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        Mark Wallabag articles as read/unread and/or starred/unstarred.
+
+        In Wallabag, "read" is the archived state: read=True archives the
+        article (clearing it from the unread list), read=False returns it to
+        unread. starred=True flags it as a favourite, starred=False clears
+        that. At least one of read or starred must be given; both can be set
+        in the same call.
+
+        IMPORTANT: Only call this function when the user explicitly instructs
+        you to mark articles read/unread or to star/unstar them. Never call it
+        proactively, and never as a side-effect of searching, fetching, or
+        summarizing articles.
+
+        Args:
+            article_ids: One Wallabag article ID, or several separated by
+                         commas, e.g. "412" or "412,413,414". IDs come from
+                         search_knowledge results (the "Article ID" field) or
+                         from get_articles_by_tag.
+            read: True marks the article(s) read (archived), False marks them
+                  unread. Omit to leave read state untouched.
+            starred: True stars the article(s), False unstars them. Omit to
+                     leave star state untouched.
+
+        Returns:
+            Confirmation with each article's title and resulting state, plus
+            any articles that could not be updated.
+        """
+        import requests
+
+        MAX_ARTICLES = 50
+
+        if not self.valves.WALLABAG_URL:
+            return "Error: Wallabag URL not configured in tool settings"
+
+        if read is None and starred is None:
+            return (
+                "Error: nothing to update — set read (true/false) and/or "
+                "starred (true/false)."
+            )
+
+        payload = {}
+        if read is not None:
+            payload['archive'] = 1 if self._as_bool(read) else 0
+        if starred is not None:
+            payload['starred'] = 1 if self._as_bool(starred) else 0
+
+        ids = []
+        for raw in str(article_ids).split(','):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                article_id = int(raw)
+            except ValueError:
+                return (
+                    f"Error: '{raw}' is not a valid article ID. Pass one integer ID, "
+                    f"or several separated by commas (e.g. \"412,413\")."
+                )
+            if article_id not in ids:
+                ids.append(article_id)
+
+        if not ids:
+            return "Error: no article IDs given."
+        if len(ids) > MAX_ARTICLES:
+            return (
+                f"Error: too many article IDs ({len(ids)}). "
+                f"Update at most {MAX_ARTICLES} articles per call."
+            )
+
+        changes = []
+        if 'archive' in payload:
+            changes.append('read' if payload['archive'] else 'unread')
+        if 'starred' in payload:
+            changes.append('starred' if payload['starred'] else 'unstarred')
+        change_desc = ' and '.join(changes)
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Marking {len(ids)} article(s) {change_desc}..."}
+            })
+
+        try:
+            token = self._get_wallabag_token()
+        except Exception as e:
+            error_msg = f"Error authenticating with Wallabag: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
+        url = self.valves.WALLABAG_URL.rstrip('/')
+        headers = {"Authorization": f"Bearer {token}"}
+
+        updated = []
+        failed = []
+
+        for article_id in ids:
+            try:
+                resp = requests.patch(
+                    f"{url}/api/entries/{article_id}.json",
+                    headers=headers,
+                    data=payload,
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                entry = resp.json()
+
+                state = 'read' if entry.get('is_archived') else 'unread'
+                state += ' · starred' if entry.get('is_starred') else ' · not starred'
+
+                updated.append({
+                    'id': article_id,
+                    'title': entry.get('title') or f'Article {article_id}',
+                    'state': state,
+                })
+            except Exception as e:
+                failed.append((article_id, str(e)))
+
+        lines = []
+        if len(updated) == 1 and not failed:
+            item = updated[0]
+            lines.append(f"Updated **{item['title']}** (ID: {item['id']}) — {item['state']}")
+        elif updated:
+            lines.append(f"Updated {len(updated)} article(s) — {change_desc}:")
+            for item in updated:
+                lines.append(f"- **{item['title']}** (ID: {item['id']}) — {item['state']}")
+
+        if failed:
+            if updated:
+                lines.append("")
+            lines.append(f"Failed ({len(failed)}):")
+            for article_id, err in failed:
+                lines.append(f"- ID {article_id}: {err}")
+
+        if __event_emitter__:
+            if updated and not failed:
+                desc = f"Marked {len(updated)} article(s) {change_desc}"
+            elif updated:
+                desc = f"Marked {len(updated)} article(s) {change_desc}, {len(failed)} failed"
+            else:
+                desc = f"Failed to update {len(failed)} article(s)"
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": desc}
+            })
+
+        return "\n".join(lines)
+
     async def get_full_document(
         self,
         file_path: str,
@@ -778,6 +996,89 @@ class Tools:
                 })
             return error_msg
 
+    async def get_kindle_highlights(
+        self,
+        file_name: str,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        Fetch every saved highlight and annotation for a specific Kindle book.
+
+        Use this after search_knowledge returns Kindle highlight snippets, when you
+        need the complete set of highlights from that book rather than just the
+        top semantic matches. Note this returns highlighted passages and personal
+        annotations only — not the book's full text.
+
+        Args:
+            file_name: The Kindle highlights JSON filename from search results
+                       (the 'File' field on a search_knowledge Kindle result).
+
+        Returns:
+            All highlights from the book with title/author metadata, in reading order
+        """
+        from urllib.parse import unquote
+        import requests
+
+        file_name = unquote(file_name)
+        full_url = self._build_static_url(self.valves.KINDLE_HIGHLIGHTS_BASE_URL, file_name)
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Fetching Kindle highlights: {file_name}..."}
+            })
+
+        try:
+            resp = requests.get(full_url, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            highlights = data.get("highlights", [])
+            result = f"**Kindle Highlights: {data.get('title', file_name)}**\n"
+            result += f"Author: {data.get('authors', 'Unknown')}\n"
+            result += f"ASIN: {data.get('asin', 'N/A')}\n"
+            result += f"Total highlights: {len(highlights)}\n\n---\n\n"
+
+            blocks = []
+            for h in highlights:
+                location = h.get("location") or {}
+                block = f"Location: {location.get('value', 'N/A')}"
+                if location.get("url"):
+                    block += f"\nKindle Link: {location['url']}"
+                text = h.get("text") or ""
+                if text:
+                    block += f"\n\n{text}"
+                if h.get("note"):
+                    block += f"\n\nNote: {h['note']}"
+                blocks.append(block)
+
+            result += "\n\n---\n\n".join(blocks)
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Retrieved {len(highlights)} highlights"}
+                })
+
+            return result
+
+        except requests.exceptions.HTTPError as e:
+            error_msg = f"Error fetching Kindle highlights '{file_name}': HTTP {e.response.status_code}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+        except Exception as e:
+            error_msg = f"Error fetching Kindle highlights '{file_name}': {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
     @staticmethod
     def _build_static_url(base_url: str, relative_path: str) -> str:
         """Build a full URL from a base URL and a relative file path."""
@@ -809,6 +1110,28 @@ class Tools:
         else:
             doc_id = payload.get('document_name', payload.get('file_path', payload.get('title', 'unknown')))
             return f"{source}:{doc_id}"
+
+    @staticmethod
+    def _dedupe_feed_chunks(points: list) -> list:
+        """
+        Collapse raw feed chunk points to one point per article.
+
+        Keeps only chunk_index == 0 points (the chunk with the article title
+        prepended) — other chunk indices are discarded, never merged. Also
+        collapses duplicate chunk_index == 0 points sharing the same article
+        key (e.g. from re-ingestion), keeping the first one encountered.
+        """
+        seen = set()
+        deduped = []
+        for point in points:
+            if point.payload.get("chunk_index", 0) != 0:
+                continue
+            key = Tools._article_key(point)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(point)
+        return deduped
 
     def _cohere_rerank(self, query: str, points: list) -> list:
         """Rerank results using Cohere's cross-encoder API. Returns points reordered by relevance."""
@@ -1171,6 +1494,8 @@ class Tools:
                     )
                     if payload.get('location_url'):
                         header += f"\nKindle Link: {payload['location_url']}"
+                    if payload.get('file_name'):
+                        header += f"\nFile: {payload['file_name']}"
                 elif source == "summary":
                     summary_type = payload.get("source_type", "unknown")
                     if summary_type == "podcast":
@@ -1236,6 +1561,156 @@ class Tools:
 
         except Exception as e:
             error_msg = f"Error searching knowledge base: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
+    async def list_recent_feed_articles(
+        self,
+        days: int = 1,
+        date_from: str = None,
+        date_to: str = None,
+        feed_name: str = None,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        List every feed article published in a time window — complete and
+        deduplicated, with no ranking, categorization, or summarization applied.
+
+        Use this instead of search_knowledge when you need an exhaustive
+        inventory of RSS/Atom feed articles for a time range (e.g. to build a
+        daily news roundup), rather than a relevance-ranked subset. This is a
+        plain Qdrant payload listing (no query embedding, no OpenAI call, no
+        semantic ranking) — every matching article is returned exactly once,
+        sorted by publication date (newest first). It does not categorize,
+        cluster, or summarize results; that is left entirely to the caller.
+
+        Args:
+            days: How many days back from today (UTC) to include, e.g. 1 means
+                  today and yesterday. Ignored if date_from or date_to is set.
+                  Default 1.
+            date_from: Optional explicit start of the window, ISO format
+                       (YYYY-MM-DD). Overrides `days` when set. If set without
+                       date_to, the window runs from date_from through now.
+            date_to: Optional explicit end of the window, ISO format
+                     (YYYY-MM-DD). Overrides `days` when set. If set without
+                     date_from, the window runs from the start of the feed
+                     archive through date_to.
+            feed_name: Optional feed name to restrict results to (e.g. 'Hacker
+                       News'), exact match, case-sensitive. Omit for all feeds.
+
+        Returns:
+            A markdown list of every matching feed article — one entry per
+            article (chunked articles collapsed to a single entry using the
+            chunk with the title prepended), each with title, feed name, URL,
+            published date, author, tags, and opening text, sorted newest
+            first. Returns a plain "No feed articles found" message if nothing
+            matches.
+        """
+        from datetime import datetime, timedelta, timezone
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Filter as QFilter, FieldCondition, MatchValue
+
+        SCROLL_PAGE_SIZE = 256
+        MAX_POINTS_SCROLLED = 20000  # safety valve, not a feature limit
+
+        if not date_from and not date_to:
+            date_from = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Listing feed articles from {date_from or 'inception'} to {date_to or 'now'}..."}
+            })
+
+        try:
+            qdrant = QdrantClient(
+                url=self.valves.QDRANT_URL,
+                api_key=self.valves.QDRANT_API_KEY or None
+            )
+
+            date_filter = self._build_date_filter(self.valves.FEEDS_COLLECTION, date_from, date_to, "published")
+
+            feed_cond = None
+            if feed_name and feed_name.strip():
+                feed_cond = FieldCondition(key="feed_name", match=MatchValue(value=feed_name.strip()))
+
+            if date_filter and feed_cond:
+                scroll_filter = QFilter(must=[*date_filter.must, feed_cond])
+            elif feed_cond:
+                scroll_filter = QFilter(must=[feed_cond])
+            else:
+                scroll_filter = date_filter
+
+            all_points = []
+            next_offset = None
+            truncated = False
+            while True:
+                page_points, next_offset = qdrant.scroll(
+                    collection_name=self.valves.FEEDS_COLLECTION,
+                    scroll_filter=scroll_filter,
+                    limit=SCROLL_PAGE_SIZE,
+                    offset=next_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                all_points.extend(page_points)
+                if next_offset is None:
+                    break
+                if len(all_points) >= MAX_POINTS_SCROLLED:
+                    truncated = True
+                    break
+
+            articles = self._dedupe_feed_chunks(all_points)
+            articles.sort(key=lambda p: p.payload.get("published_ts", 0), reverse=True)
+
+            if not articles:
+                window_desc = f"{date_from or 'the start of the archive'} to {date_to or 'now'}"
+                feed_desc = f" for feed '{feed_name.strip()}'" if feed_name and feed_name.strip() else ""
+                return f"No feed articles found{feed_desc} between {window_desc}."
+
+            article_blocks = []
+            for point in articles:
+                payload = point.payload
+                header = (
+                    f"**Feed Article: {payload.get('title', 'Untitled')}**\n"
+                    f"Feed: {payload.get('feed_name', payload.get('feed_url', 'Unknown Feed'))}\n"
+                    f"URL: {payload.get('url', 'N/A')}"
+                )
+                if payload.get('published'):
+                    header += f"\nPublished: {payload['published']}"
+                if payload.get('author'):
+                    header += f"\nAuthor: {payload['author']}"
+                if payload.get('tags'):
+                    header += f"\nTags: {', '.join(payload['tags'])}"
+                text = payload.get('text', '')
+                article_blocks.append(f"{header}\n\n{text}\n\n---")
+
+            heading = f"## Feed Articles ({len(articles)} total)"
+            if feed_name and feed_name.strip():
+                heading += f" — {feed_name.strip()}"
+
+            result = heading + "\n\n" + "\n\n".join(article_blocks)
+            if truncated:
+                result += (
+                    f"\n\n_(Stopped after scanning {MAX_POINTS_SCROLLED} raw points; "
+                    f"the window may contain more articles — narrow the date range or "
+                    f"feed_name filter to see all of them.)_"
+                )
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Found {len(articles)} feed articles"}
+                })
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error listing feed articles: {str(e)}"
             if __event_emitter__:
                 await __event_emitter__({
                     "type": "status",
