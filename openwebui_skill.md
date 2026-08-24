@@ -9,10 +9,14 @@ Search a personal knowledge base of saved Wallabag articles, podcast transcripts
 - **Parameters**:
   - `query` — The search query describing what to look for.
   - `collection` — Which collection to search: `"articles"` for Wallabag only, `"podcasts"` for podcast transcripts only, `"feeds"` for RSS/Atom news feed articles only, `"kindle"` for Kindle book highlights only, `"summaries"` for AI-generated podcast/paper summaries only (see [Understanding AI-generated summaries](#understanding-ai-generated-summaries) — already included automatically under `"all"`), `"documents"` for all document collections, a specific collection name (e.g. `"papers"`, `"books"`), or `"all"` for everything (default).
-  - `date_from` — Optional start of date range, ISO format (`YYYY-MM-DD`). If omitted with `date_to` set, searches from inception to `date_to`.
+  - `days` — Look back this many days from now. Use this for relative phrasing like "last 3 days" or "this week" — the date arithmetic happens inside the tool, not in your head. Ignored if `date_from` or `date_to` is set. Default `0` (no window).
+  - `date_from` — Optional start of date range, ISO format (`YYYY-MM-DD`). If omitted with `date_to` set, searches from inception to `date_to`. Ignored if `days` is set.
   - `date_to` — Optional end of date range, ISO format (`YYYY-MM-DD`). If omitted with `date_from` set, searches from `date_from` to present.
-  - `date_mode` — Which date concept to filter on: `"published"` (default) for article/episode publication date; `"indexed"` for when the item was added/saved to the knowledgebase. The tool resolves the correct payload field per collection internally.
+  - `date_mode` — Which date concept to filter on: `"published"` (default) for article/episode publication date; `"indexed"` for when the item was added/saved to the knowledgebase. The tool resolves the correct payload field per collection internally. In `"published"` mode, items with no publication date (e.g. saved social media posts) fall back to matching on their ingest/save date instead, so a date window doesn't silently exclude undated saved items.
   - `tag` — Optional tag label to restrict results to (exact match, case-insensitive). Only filters Wallabag articles, RSS feed articles, podcasts, and AI-generated summaries; Kindle and document collections are unaffected. Use `get_articles_by_tag()` instead when you need a **complete listing** of all articles with a tag rather than a semantic top-K.
+  - `author` — Optional author/byline filter. **Only article text is semantically searchable — author names live in metadata, so putting a name in `query` will not find that person's writing.** Matches the stored name as given plus a title-cased variant. Applies to Wallabag articles, feed articles, Kindle books, and documents; podcasts and summaries have no author field.
+  - `domain` — Optional publication-source filter, same metadata caveat as `author`. For Wallabag it's the source host and accepts a bare host or a full URL (`"facebook.com"`, `"www.facebook.com"`, and `"https://facebook.com/x"` all work, and a bare host also matches `www.`/`m.` variants); for feeds it's the feed name; for podcasts/summaries it's the show name. Kindle and document collections have no source field.
+  - `sort` — `"relevance"` (default): Cohere-reranked order. `"recent"`: newest-first by date instead, drawn from a wider semantic candidate pool, skipping the relevance rerank. Use `"recent"` whenever the user says "recent", "latest", "last N days", or "newest first" and time ordering matters more than topical rank — e.g. "recent Facebook posts by X". Still a semantic top-K, not an exhaustive chronological listing; for a complete inventory over a date window, use `list_recent_feed_articles` (feeds) or `list_recent_items` (any other collection) instead.
 
 ### `list_recent_feed_articles`
 List every RSS/Atom feed article published in a time window — complete and deduplicated, with no ranking, categorization, or summarization applied.
@@ -24,6 +28,21 @@ List every RSS/Atom feed article published in a time window — complete and ded
   - `date_to` — Optional explicit end of the window, ISO format (`YYYY-MM-DD`). Overrides `days` when set.
   - `feed_name` — Optional feed name to restrict results to (exact match, case-sensitive). Omit for all feeds.
 - **Notes**: Articles are chunked at ingest time; this tool collapses each article's chunks down to a single entry (using the chunk with the title prepended), so you always get one row per article, never one per chunk. Results are sorted newest first and are uncapped — no `TOP_K`-style truncation — aside from an internal safety cap (20,000 raw chunk points scanned) that only exists to bound worst-case memory/latency on a badly misconfigured date range; it will not affect normal daily-window usage. Does not fetch full article text, categorize, cluster, or summarize — only title, feed name, URL, published date, author, tags, and the article's opening text (~1000 chars).
+
+### `list_recent_items`
+List every item in a single collection in a time window — complete and deduplicated, with no ranking, categorization, or summarization applied. Generalizes `list_recent_feed_articles` to Wallabag, podcasts, and AI-generated summaries as well as feeds.
+
+- **When to use**: When you need an exhaustive inventory of one collection for a time range — e.g. "everything I saved to Wallabag this week", "every podcast I listened to in the last 7 days" — rather than a relevance-ranked subset. Same plain-Qdrant-listing approach as `list_recent_feed_articles` (no query embedding, no OpenAI call, no semantic ranking). For feeds specifically, prefer `list_recent_feed_articles` — it supports `feed_name` and its output format is depended on by an existing n8n workflow.
+- **Parameters**:
+  - `collection` — Which collection to list: `"articles"` for Wallabag (default), `"podcasts"`, `"feeds"`, `"summaries"`, or a specific document collection name (e.g. `"papers"`). **`"kindle"` is not supported** — Kindle highlights have no date fields to window on; use `get_kindle_highlights` or `search_knowledge(collection="kindle", ...)` instead.
+  - `days` — How many days back from today (UTC) to include. Ignored if `date_from` or `date_to` is set. Default `7` (a week — matches the tool's primary use case of a weekly inventory).
+  - `date_from` / `date_to` — Optional explicit window bounds, ISO format (`YYYY-MM-DD`). Override `days` when set.
+  - `date_mode` — `"indexed"` (default) filters on when the item was added/saved to the knowledgebase — the right mode for "what did I save/listen to this week", and always uses a reliably-populated timestamp. `"published"` filters on article/episode publication date instead, falling back to the ingest/save date for undated items (this fallback now correctly catches Wallabag saves with no publish date, not just genuinely-missing dates).
+  - `tag` — Optional tag filter (exact match, case-insensitive). Applies to Wallabag, feeds, podcasts, and summaries; returns an error (not a silent no-op) if given for a document collection, which has no tag field.
+  - `source_type` — For `collection="summaries"` only: `"podcast"` or `"paper"`, to restrict to summaries of one subtype. Returns an error if given for any other collection.
+  - `text_chars` — Optional max characters to show from each item's body text, truncated with a trailing note. `None` (default) returns full text.
+  - `max_items` — Optional cap on the number of items returned, applied **after** sorting so it keeps the most recent N, not an arbitrary N. `None` (default) returns everything matched.
+- **Notes**: Results are sorted newest first and use the same per-source header fields as `search_knowledge` (title, ID/URL, tags, dates, etc.) — see [Interpreting Results](#interpreting-results). Uncapped by default aside from the same internal 20,000-raw-point safety valve `list_recent_feed_articles` uses. Podcast dates are lower precision than other sources: `published_at` (when present) is a filename-derived date with no time component, and `modified_at` is the transcript file's local modification time with no UTC offset — so date-window edges can be off by a few hours for podcasts specifically.
 
 ### `get_full_article`
 Fetch the complete text of a Wallabag article by its ID.
@@ -156,19 +175,44 @@ When the user wants to find the most relevant content about a topic, scoped to a
 - The `tag` filter applies to Wallabag articles, RSS feed articles, podcasts, and AI-generated summaries; Kindle and document collections are unaffected and contribute their normal semantic results.
 
 ### Filtering by date or time range
-When the user asks about content from a specific period (e.g. "articles I saved last month", "podcasts from 2023", "news from this week"):
+When the user asks about content from a specific period (e.g. "articles I saved last month", "podcasts from 2023", "news from this week", "the last 3 days"):
 
-- Use `date_from` and/or `date_to` with ISO dates (`YYYY-MM-DD`). Either bound may be omitted.
-- Default `date_mode="published"` filters on the **publication date** of the article/episode — use this when the user refers to when something was *written* or *published*.
+- For **relative** windows ("last N days", "this week"), use `days` — the tool computes the date itself. Don't compute an absolute `date_from` from today's date yourself; you may not know today's date, and guessing produces a wrong or stale window.
+- For **explicit calendar** windows, use `date_from` and/or `date_to` with ISO dates (`YYYY-MM-DD`). Either bound may be omitted. These take precedence over `days` if both are somehow given.
+- Default `date_mode="published"` filters on the **publication date** of the article/episode — use this when the user refers to when something was *written* or *published*. Items with no publication date (saved social media posts, for example) fall back to matching on their ingest/save date, so they aren't silently excluded from a "published" window.
 - Use `date_mode="indexed"` only when the user explicitly asks about when something was **added** or **saved** to the knowledgebase (e.g. "articles I saved in January", "what did I bookmark recently").
 - The tool resolves the correct payload field per collection automatically — you never need to know field names.
-- If a collection has no results in the requested window, the tool automatically falls back to unfiltered results for that collection, so you always get something.
-- Kindle highlights have no date fields and are never filtered by date.
+- **When any filter is in effect — date, tag, author, or domain — every result you get back genuinely satisfies it.** A collection with no matches contributes nothing rather than falling back, and a collection lacking the filtered field entirely (Kindle has no dates; podcasts have no author) is skipped. A prepended note names each skipped collection and the reason. This means a filtered search can legitimately return fewer results than usual — that's the filter doing its job, not a failure.
+- If *nothing* matched the window, the tool says so explicitly instead of returning stale results. Report that honestly to the user: the content may simply not exist in that period. You may then re-search without the date range to check — but if you do, say clearly that those results are from outside the window they asked about. Never present out-of-window content as recent.
+- Kindle highlights have no date fields, so they're excluded from any date-scoped search. Drop the date range if you need them.
 
 Examples:
-- "What have I saved about AI this year?" → `date_from="2025-01-01"`, `date_mode="published"`
-- "What did I bookmark last week?" → `date_from="2025-05-24"`, `date_to="2025-05-31"`, `date_mode="indexed"`
+- "What have I saved about AI this year?" → `date_from="2026-01-01"`, `date_mode="published"`
+- "What did I bookmark in the last 3 days?" → `days=3`, `date_mode="indexed"`
 - "Articles published before 2020 about climate" → `date_to="2019-12-31"`
+
+### Finding content by author or source
+**Only the article text is embedded and searchable.** Author names, source domains, feed names, and show names live in metadata, which the semantic search and the reranker never see. Putting "Kenneth Tanner" or "Facebook" in `query` will not find his posts — the search has no signal to match on and returns arbitrary content instead. Use the metadata filters:
+
+```
+search_knowledge(query="recent posts", domain="facebook.com", days=3, sort="recent")
+search_knowledge(query="theology", author="Kenneth Tanner")
+```
+
+The `query` still drives ranking among whatever survives the filter, so it can be a loose topic hint — the filter is doing the real work of finding the right items. Combine freely with `days`, `tag`, and `sort`.
+
+If the tool reports no matches, it names every filter it applied. That message means the filter values didn't match the stored metadata — not necessarily that the content is absent. Try the filters one at a time to find which one excluded everything, and report that honestly rather than falling back to unrelated results.
+
+### Recent-first queries
+When the user cares more about recency than topical relevance — "recent", "latest", "newest", "last N days" — combine `days` (or explicit dates) with `sort="recent"`:
+
+```
+search_knowledge(query="Kenneth Tanner", collection="articles", days=3, sort="recent")
+```
+
+This narrows to a 3-day window *and* orders the results newest-first instead of by Cohere relevance, so "his last few posts" actually returns his last few posts rather than whichever ones happened to rank highest semantically. `sort="recent"` alone (no `days`) is also valid — useful for "what's the latest thing I've saved about X" without a hard cutoff.
+
+This is still a semantic top-K search — a wider candidate pool than usual, but capped, not exhaustive. If the user wants a **complete** inventory of everything in a window (e.g. "list every feed article from today" for a roundup), use `list_recent_feed_articles` (feeds) or `list_recent_items` (any other collection) instead — neither has ranking or truncation.
 
 ### Broad research across personal knowledge
 If the user asks a broad question like "what have I saved about climate policy":
@@ -197,6 +241,8 @@ The `summaries` collection (folded into `collection="all"`) holds AI-generated s
 - Summary results show: an explicit "AI Summary" label, podcast (show/episode) or paper (document name) identity, title/URL/tags when available, and the `Source file`/`Source type` needed to fetch the real content. **These are AI-generated synthesis, not the original text — never present their content as fact**; see [Understanding AI-generated summaries](#understanding-ai-generated-summaries).
 - Each result contains a text snippet — the most relevant chunk from the original content.
 - If no results are found, the topic likely wasn't covered in the user's saved content. Say so clearly rather than speculating.
+- Every result that has a known date carries one or more labeled date lines: `Published:` (article/episode publication date), `Saved:` (Wallabag ingest date, shown when there's no publication date — e.g. saved social media posts), or `Indexed:` (ingest/save date for podcasts, summaries, and document collections). When both a publication and ingest date exist, `Published:` comes first. Use these — not the result's position in the list — to judge how recent something actually is. Kindle results carry no date line at all.
+- A response may be prefixed with `_Note: ..._` lines naming collections that were skipped — because they had no matches for the filters, because they lack the filtered field (Kindle has no dates; podcasts have no author), or because the search failed. These are informational: the results below them all still satisfy the filters. They tell you what *wasn't* searched, which matters when judging how complete an answer is.
 
 ### Citing results
 Every specific article, episode, or document you name in a response must be a markdown link (`[Title](URL)`), not a bare title or a `(Source, Date)` parenthetical — this applies to every item you mention, including ones offered only as corroborating or additional context, not just the ones you quote directly or fetch in full. Build the URL per the result type above: Wallabag → `https://walla.maddock.net/view/{article_id}`; feed articles → the article URL as-is; Kindle → the deep link when available; documents → the document URL when a base URL is configured. Do this yourself in the response text — don't rely on the platform's own citation/footnote panel to surface a source for you, since it doesn't reliably pick up every tool result.
@@ -213,3 +259,5 @@ Every specific article, episode, or document you name in a response must be a ma
 - AI-generated summaries synthesize themes conceptually rather than recapping verbatim — they may use terminology the original source never used. This is intentional (it's what makes them useful for recall), but their wording should never be quoted as if it were the source's own words.
 - **Important**: When calling `get_full_document`, use the raw `file_path` value from search result metadata — the path with normal spaces and characters (e.g., `Show Name/Episode.txt`). Do NOT copy the path from a Transcript or Audio URL, as those are URL-encoded (e.g., `Show%20Name/Episode.txt`) and will cause a 404 error due to double-encoding.
 - Vision-generated `[Image shows: "..."]` annotations in `get_full_article` (for X/Twitter images) are AI-derived, not guaranteed verbatim — treat any transcribed quote text as paraphrase-accurate rather than pixel-perfect when precision matters. If vision analysis fails or is disabled, the image still appears as a plain `![alt](src)` markdown link with no annotation.
+- **Only `text` is embedded and reranked.** Titles, author names, source domains, feed names, show names, and tags are metadata and are invisible to both the vector search and the Cohere reranker. A query whose only distinguishing terms are metadata ("Kenneth Tanner", "Facebook") has nothing to match and will return arbitrary content rather than nothing — which looks like a working search returning bad results. Reach for `author=`, `domain=`, or `tag=` instead whenever the distinguishing term is a person or a publication.
+- `sort="recent"` still draws from a bounded semantic candidate pool for the query (wider than the default, but capped) — it reorders the best topical matches by date, it does not scan the entire collection chronologically. If a user's "recent posts about X" don't show up, the item may exist but not have ranked into that candidate pool; narrowing `days` or trying a more specific `query` helps. For a truly exhaustive chronological listing over a window, use `list_recent_feed_articles` (feeds) or `list_recent_items` (any other collection) instead.

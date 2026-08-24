@@ -12,9 +12,14 @@ Installation:
 4. Enable the tool for your models
 
 Usage:
-The LLM can call search_knowledge(query, collection, date_from, date_to, date_mode, tag) to
-retrieve relevant context from your indexed articles, transcripts, document collections,
-feeds, and summaries.
+The LLM can call search_knowledge(query, collection, date_from, date_to, date_mode, tag,
+days, sort, author, domain) to retrieve relevant context from your indexed articles,
+transcripts, document collections, feeds, and summaries. `days` computes a relative
+date_from (e.g. "last 3 days") without the caller needing to know today's date.
+`sort="recent"` orders results newest-first over a wider candidate pool instead of by
+relevance. `author` and `domain` filter on metadata, which is NOT semantically
+searchable — only the article text is embedded, so an author or source name placed in
+`query` will never match.
 It can call get_full_article(article_id) to fetch full Wallabag article text
 plus any Wallabag annotations (highlights and notes) on that article,
 get_full_document(file_path, source_type) to fetch full document/podcast text
@@ -26,6 +31,15 @@ retrieve a complete, deduplicated listing of every RSS/Atom feed article in a
 time window — unranked and uncapped, with no categorization or summarization —
 for downstream pipelines (e.g. an n8n daily news roundup) rather than
 relevance search.
+
+It can call list_recent_items(collection, days, date_from, date_to, date_mode,
+tag, source_type, text_chars, max_items) to retrieve the same kind of complete,
+deduplicated, date-windowed listing as list_recent_feed_articles but for any
+single collection — Wallabag articles, podcasts, feeds, AI-generated summaries,
+or a configured document collection — for downstream pipelines (e.g. an n8n
+weekly inventory of saves and podcast listens) rather than relevance search.
+Not available for 'kindle' (no date fields) — use get_kindle_highlights or
+search_knowledge instead.
 
 It can call update_article_status(article_ids, read, starred) to mark one or
 more Wallabag articles read/unread (archived) and/or starred/unstarred, only
@@ -44,7 +58,7 @@ source_file + source_type) before citing specifics.
 title: Qdrant Knowledge Search
 author: adam
 description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, RSS/Atom feeds, Kindle highlights, and AI-generated summaries)
-version: 1.12.0
+version: 1.16.0
 """
 
 from typing import Callable
@@ -1089,6 +1103,52 @@ class Tools:
         encoded_path = "/".join(quote(segment, safe="") for segment in decoded_path.split("/"))
         return f"{base_url.rstrip('/')}/{encoded_path}"
 
+    # source → [(label, payload_key), ...] in display order. Publication date
+    # (when present) always comes before ingest date. Sources not listed here
+    # (document collections) fall back to the ("Indexed", "modified_at") pair
+    # below rather than being silently dateless; Kindle has no date fields at
+    # all and is deliberately absent so it renders no date line.
+    _DATE_FIELDS = {
+        "wallabag": [("Published", "published_at"), ("Saved", "created_at")],
+        "podcast_transcript": [("Published", "published_at"), ("Indexed", "modified_at")],
+        "summary": [("Published", "published_at"), ("Indexed", "modified_at")],
+        "feed": [("Published", "published")],
+    }
+
+    @staticmethod
+    def _normalize_date(value) -> str:
+        """Render a payload date value as YYYY-MM-DD; pass through unparseable input as-is."""
+        from datetime import datetime
+
+        if not value:
+            return ""
+        text = str(value)
+        if "T" in text:
+            text = text.split("T")[0]
+        try:
+            # Validate it's actually a date; keep the normalized ISO form.
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+        except ValueError:
+            return text
+
+    @classmethod
+    def _date_lines(cls, payload: dict, source: str) -> list[str]:
+        """Return labeled date lines (e.g. 'Published: 2026-08-19') for a result's header.
+
+        Every source that has any date field ends up with at least one labeled
+        line — including items with no publication date (e.g. saved Facebook
+        posts), which fall back to their ingest date so results are never
+        rendered completely undated.
+        """
+        field_pairs = cls._DATE_FIELDS.get(source, [("Indexed", "modified_at")])
+        lines = []
+        for label, key in field_pairs:
+            raw = payload.get(key)
+            normalized = cls._normalize_date(raw)
+            if normalized:
+                lines.append(f"{label}: {normalized}")
+        return lines
+
     @staticmethod
     def _article_key(point) -> str:
         """Return a grouping key for a result point (article ID, episode name, etc.)."""
@@ -1112,19 +1172,28 @@ class Tools:
             return f"{source}:{doc_id}"
 
     @staticmethod
-    def _dedupe_feed_chunks(points: list) -> list:
+    def _dedupe_chunks(points: list) -> list:
         """
-        Collapse raw feed chunk points to one point per article.
+        Collapse raw chunk points to one point per article/episode/document.
 
-        Keeps only chunk_index == 0 points (the chunk with the article title
-        prepended) — other chunk indices are discarded, never merged. Also
-        collapses duplicate chunk_index == 0 points sharing the same article
-        key (e.g. from re-ingestion), keeping the first one encountered.
+        Keeps only chunk_index == 0 AND chunk_type == "body" (default "body"
+        when the key is absent — only wallabag_ingest.py ever sets chunk_type;
+        every other source never has the key, so this is a no-op for them).
+        Without the chunk_type check, Wallabag annotation points — which have
+        chunk_type == "annotation" and NO chunk_index key at all — would
+        default-match chunk_index == 0 and masquerade as an article's first
+        body chunk, emitting one spurious entry per highlight/note.
+
+        Also collapses duplicate matching points sharing the same key (e.g.
+        from re-ingestion), keeping the first one encountered.
         """
         seen = set()
         deduped = []
         for point in points:
-            if point.payload.get("chunk_index", 0) != 0:
+            payload = point.payload
+            if payload.get("chunk_index", 0) != 0:
+                continue
+            if payload.get("chunk_type", "body") != "body":
                 continue
             key = Tools._article_key(point)
             if key in seen:
@@ -1132,6 +1201,134 @@ class Tools:
             seen.add(key)
             deduped.append(point)
         return deduped
+
+    @staticmethod
+    def _recency_ts(point) -> float:
+        """Return a Unix timestamp for a result point, for sort='recent' ordering.
+
+        Feeds already carry a numeric published_ts. Everything else parses its
+        best available ISO date (publication date first, then the source's
+        ingest/save date) — the same fallback order _date_lines displays.
+        Kindle highlights have no date fields and sink to 0.0 (oldest).
+        """
+        from datetime import datetime, timezone
+
+        payload = point.payload
+        source = payload.get("source", "unknown")
+
+        if source == "feed":
+            return float(payload.get("published_ts") or 0.0)
+
+        candidates = [k for _, k in Tools._DATE_FIELDS.get(source, [("Indexed", "modified_at")])]
+        for key in candidates:
+            raw = payload.get(key)
+            if not raw:
+                continue
+            try:
+                text = str(raw).replace("Z", "+00:00")
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except ValueError:
+                continue
+        return 0.0
+
+    def _format_recent_item_header(self, payload: dict, source: str, collection_name: str = None) -> str:
+        """Build one entry's header block for list_recent_items.
+
+        The 'feed' branch is a deliberate verbatim duplicate of
+        list_recent_feed_articles's inline header (not a shared call) —
+        that function's exact output is parsed by a live n8n workflow and
+        must not change. Keep both in sync manually if either is edited.
+        """
+        if source == "feed":
+            header = (
+                f"**Feed Article: {payload.get('title', 'Untitled')}**\n"
+                f"Feed: {payload.get('feed_name', payload.get('feed_url', 'Unknown Feed'))}\n"
+                f"URL: {payload.get('url', 'N/A')}"
+            )
+            if payload.get('published'):
+                header += f"\nPublished: {payload['published']}"
+            if payload.get('author'):
+                header += f"\nAuthor: {payload['author']}"
+            if payload.get('tags'):
+                header += f"\nTags: {', '.join(payload['tags'])}"
+            return header
+
+        if source == "wallabag":
+            header = (
+                f"**Article: {payload.get('title', 'Untitled')}**\n"
+                f"Article ID: {payload.get('article_id')}\n"
+                f"Source: {payload.get('domain', 'unknown')}\n"
+                f"URL: {payload.get('url', 'N/A')}"
+            )
+            if payload.get('tags'):
+                header += f"\nTags: {', '.join(payload['tags'])}"
+            if payload.get('published_by'):
+                header += f"\nAuthor: {', '.join(payload['published_by'])}"
+        elif source == "podcast_transcript":
+            header = (
+                f"**Podcast: {payload.get('show_name', 'Unknown Show')}**\n"
+                f"Episode: {payload.get('episode_name', 'Unknown Episode')}"
+            )
+            if self.valves.PODCASTS_BASE_URL:
+                file_path = payload.get('file_path', '')
+                if file_path:
+                    header += f"\nTranscript: {self._build_static_url(self.valves.PODCASTS_BASE_URL, file_path)}"
+                audio_file = payload.get('audio_file', '')
+                if audio_file:
+                    header += f"\nAudio: {self._build_static_url(self.valves.PODCASTS_BASE_URL, audio_file)}"
+            if payload.get('tags'):
+                header += f"\nTags: {', '.join(payload['tags'])}"
+        elif source == "summary":
+            summary_type = payload.get("source_type", "unknown")
+            if summary_type == "podcast":
+                header = (
+                    f"**AI Summary — Podcast: {payload.get('show_name', 'Unknown Show')}**\n"
+                    f"Episode: {payload.get('episode_name', 'Unknown Episode')}"
+                )
+            elif summary_type == "paper":
+                header = f"**AI Summary — Paper: {payload.get('document_name', 'Unknown Document')}**"
+            else:
+                header = f"**AI Summary: {payload.get('title', 'Untitled')}**"
+            if payload.get('title'):
+                header += f"\nTitle: {payload['title']}"
+            if payload.get('url'):
+                header += f"\nURL: {payload['url']}"
+            if payload.get('tags'):
+                header += f"\nTags: {', '.join(payload['tags'])}"
+            header += f"\nSource type: {summary_type}"
+            if payload.get('source_file'):
+                header += f"\nSource file: {payload['source_file']}"
+            header += (
+                "\nNOTE: This is an AI-generated SUMMARY, not the original source — written "
+                "purely to aid semantic search recall. Do not cite its wording as fact. Before "
+                "presenting specifics, fetch the real content with get_full_document(file_path="
+                "<Source file above>, source_type=<Source type above>), or search the full "
+                "transcript/paper collection instead."
+            )
+        else:  # document collections (papers/books/etc.)
+            doc_name = payload.get('document_name', payload.get('title', 'Unknown Document'))
+            header = f"**Document: {doc_name}**\nCollection: {collection_name or source}"
+            file_path = payload.get('file_path', '')
+            if file_path:
+                header += f"\nFile: {file_path}"
+            base_url = self._get_base_url_for_source(collection_name or source)
+            if base_url:
+                link_path = payload.get('original_file') or file_path
+                if link_path:
+                    header += f"\nURL: {self._build_static_url(base_url, link_path)}"
+            for key in ['author', 'date', 'category', 'tags']:
+                if key in payload:
+                    val = payload[key]
+                    if isinstance(val, list):
+                        val = ', '.join(str(v) for v in val)
+                    header += f"\n{key.title()}: {val}"
+
+        for line in self._date_lines(payload, source):
+            header += f"\n{line}"
+        return header
 
     def _cohere_rerank(self, query: str, points: list) -> list:
         """Rerank results using Cohere's cross-encoder API. Returns points reordered by relevance."""
@@ -1202,7 +1399,9 @@ class Tools:
             return None
 
         from datetime import date, datetime, timezone
-        from qdrant_client.models import DatetimeRange, Filter, FieldCondition, Range
+        from qdrant_client.models import (
+            DatetimeRange, Filter, FieldCondition, Range, IsEmptyCondition, PayloadField, MatchValue,
+        )
 
         is_feeds = coll_name == self.valves.FEEDS_COLLECTION
         is_wallabag = coll_name == self.valves.WALLABAG_COLLECTION
@@ -1210,6 +1409,12 @@ class Tools:
         is_doc = coll_name in self._get_document_collection_names()
         is_summaries = coll_name == self.valves.SUMMARIES_COLLECTION
 
+        # fallback_key, when set, is an ingest/save-date field to additionally
+        # match on (in "published" mode only) for items with no primary date —
+        # e.g. saved social media posts that were never published in the usual
+        # sense. Only wallabag/podcast/summaries have both a publication-date
+        # field and a distinct ingest-date field worth falling back to.
+        fallback_key = None
         if date_mode == "indexed":
             if is_wallabag:
                 payload_key = "created_at"
@@ -1222,8 +1427,12 @@ class Tools:
         else:  # "published" (default)
             if is_feeds:
                 payload_key = "published_ts"
-            elif is_wallabag or is_podcast or is_summaries:
+            elif is_wallabag:
+                payload_key = "published_at"
+                fallback_key = "created_at"
+            elif is_podcast or is_summaries:
                 payload_key = "published_at"  # summaries: reliable for podcast-type, sparse for paper-type
+                fallback_key = "modified_at"
             elif is_doc:
                 payload_key = "modified_at"
             else:
@@ -1247,7 +1456,29 @@ class Tools:
                 range_kwargs["lte"] = date.fromisoformat(date_to)
             range_filter = DatetimeRange(**range_kwargs)
 
-        return Filter(must=[FieldCondition(key=payload_key, range=range_filter)])
+        primary_condition = FieldCondition(key=payload_key, range=range_filter)
+        if not fallback_key:
+            return Filter(must=[primary_condition])
+
+        # Additive fallback: also match items with no primary (publication)
+        # date whose ingest/save date falls in the window, so a "published"
+        # window still surfaces undated saved items instead of silently
+        # excluding them. Nothing that already matches the primary date is
+        # affected — this only widens the match. "No primary date" means
+        # either a genuinely empty/missing field (IsEmptyCondition) OR an
+        # empty string (wallabag_ingest.py writes published_at as '' rather
+        # than omitting the key when Wallabag has no publish date, and
+        # Qdrant's is_empty does not match "" — only null/missing/[]).
+        return Filter(should=[
+            primary_condition,
+            Filter(must=[
+                Filter(should=[
+                    IsEmptyCondition(is_empty=PayloadField(key=payload_key)),
+                    FieldCondition(key=payload_key, match=MatchValue(value="")),
+                ]),
+                FieldCondition(key=fallback_key, range=range_filter),
+            ]),
+        ])
 
     def _build_tag_condition(self, coll_name: str, tag: str):
         """Return a FieldCondition matching tag in the tags array, or None if not applicable."""
@@ -1262,6 +1493,90 @@ class Tools:
             return None
         return FieldCondition(key="tags", match=MatchValue(value=tag.strip().lower()))
 
+    def _build_author_condition(self, coll_name: str, author: str):
+        """Return a FieldCondition matching an author name, or None if the collection has no author field.
+
+        Author names are stored as written (unlike tags, which are lowercased at
+        ingest), so match on the value as given plus a title-cased variant rather
+        than normalizing case away.
+        """
+        from qdrant_client.models import FieldCondition, MatchAny
+
+        if coll_name == self.valves.WALLABAG_COLLECTION:
+            key = "published_by"  # list — Qdrant matches if any element matches
+        elif coll_name == self.valves.FEEDS_COLLECTION:
+            key = "author"
+        elif coll_name == self.valves.KINDLE_COLLECTION:
+            key = "authors"
+        elif coll_name in self._get_document_collection_names():
+            key = "author"
+        else:
+            return None  # podcasts / summaries — no author field (show_name is the analog)
+
+        name = author.strip()
+        variants = []
+        for v in (name, name.title()):
+            if v and v not in variants:
+                variants.append(v)
+        return FieldCondition(key=key, match=MatchAny(any=variants))
+
+    @staticmethod
+    def _domain_variants(domain: str) -> list[str]:
+        """Normalize a domain input to a list of plausible stored host values.
+
+        Accepts a bare host, a host with a subdomain, or a full URL, and returns
+        the bare host plus common 'www.'/'m.' prefixed forms so a caller passing
+        'facebook.com' still matches a payload storing 'www.facebook.com'.
+        """
+        text = (domain or "").strip().lower()
+        if "//" in text:
+            text = text.split("//", 1)[1]
+        text = text.split("/", 1)[0].split("?", 1)[0].strip()
+        if not text:
+            return []
+
+        bare = text
+        for prefix in ("www.", "m.", "mobile."):
+            if bare.startswith(prefix):
+                bare = bare[len(prefix):]
+                break
+
+        variants = []
+        for v in (bare, f"www.{bare}", f"m.{bare}", text):
+            if v and v not in variants:
+                variants.append(v)
+        return variants
+
+    def _build_domain_condition(self, coll_name: str, domain: str):
+        """Return a FieldCondition matching a publication source, or None if not applicable.
+
+        'domain' means the Wallabag article's source host; for feeds and podcasts
+        the equivalent identity is the feed name / show name, matched as given.
+        """
+        from qdrant_client.models import FieldCondition, MatchAny
+
+        if coll_name == self.valves.WALLABAG_COLLECTION:
+            variants = self._domain_variants(domain)
+            if not variants:
+                return None
+            return FieldCondition(key="domain", match=MatchAny(any=variants))
+
+        if coll_name == self.valves.FEEDS_COLLECTION:
+            key = "feed_name"
+        elif coll_name in (self.valves.PODCAST_COLLECTION, self.valves.SUMMARIES_COLLECTION):
+            key = "show_name"
+        else:
+            return None  # kindle / documents — no publication source field
+
+        name = domain.strip()
+        if not name:
+            return None
+        variants = []
+        for v in (name, name.title()):
+            if v not in variants:
+                variants.append(v)
+        return FieldCondition(key=key, match=MatchAny(any=variants))
+
     async def search_knowledge(
         self,
         query: str,
@@ -1270,6 +1585,10 @@ class Tools:
         date_to: str = None,
         date_mode: str = "published",
         tag: str = None,
+        days: int = 0,
+        sort: str = "relevance",
+        author: str = None,
+        domain: str = None,
         __event_emitter__: Callable[[dict], None] = None,
     ) -> str:
         """
@@ -1292,23 +1611,71 @@ class Tools:
                         - 'all' for everything (default)
             date_from: Optional start of date range, ISO format (YYYY-MM-DD).
                        If omitted with date_to set, searches from inception to date_to.
+                       Ignored if days is set. For relative phrasing like "last 3
+                       days", use days instead — don't compute an absolute date
+                       yourself.
             date_to: Optional end of date range, ISO format (YYYY-MM-DD).
                      If omitted with date_from set, searches from date_from to present.
             date_mode: Which date concept to filter on:
-                       - 'published' (default) — article/episode publication date
+                       - 'published' (default) — article/episode publication date.
+                         Falls back to the item's ingest/save date when it has no
+                         publication date (e.g. saved social media posts), so a
+                         "published" window still catches undated saved items
+                         instead of silently excluding them.
                        - 'indexed' — when the item was added/saved to the knowledgebase
             tag: Optional tag label to restrict results to (exact match, case-insensitive).
                  Applies to Wallabag articles, RSS feed articles, podcasts, and AI-generated
                  summaries. Use get_articles_by_tag() instead when you need a complete listing.
+            days: Look back this many days from now. Use this for relative phrasing
+                  like "last 3 days" or "this week" — the date arithmetic happens
+                  here, not in your head. Ignored if date_from or date_to is set.
+                  Default 0 (no window).
+            sort: 'relevance' (default) — Cohere-reranked (or embedding-score) order.
+                  'recent' — newest first by publication/ingest date instead, over a
+                  wider semantic candidate pool, skipping the relevance rerank. Use
+                  this when the user says "recent", "latest", "last N days", or
+                  "newest first" and time ordering matters more than topical rank.
+                  This still draws from the top semantic matches for the query —
+                  it is not an exhaustive chronological listing; for a complete
+                  inventory over a date window, use list_recent_feed_articles
+                  (feeds) or list_recent_items (any other collection) instead.
+            author: Optional author/byline to restrict results to. IMPORTANT: only
+                    the article TEXT is semantically searchable — author names live
+                    in metadata, so putting a name in `query` will NOT find that
+                    person's writing. Use this parameter instead. Matches the stored
+                    name as given (plus a title-cased variant); applies to Wallabag
+                    articles, feed articles, Kindle books, and documents.
+            domain: Optional publication source to restrict results to. Same caveat
+                    as author — source names are metadata and are NOT reachable via
+                    `query`. For Wallabag this is the article's source host, given
+                    bare or as a URL ('facebook.com', 'www.facebook.com', or
+                    'https://facebook.com/x' all work); for feeds it's the feed name;
+                    for podcasts/summaries it's the show name.
 
         Returns:
             Relevant context from the knowledge base, formatted with source information.
+            Each result's header includes its known date(s), labeled by what they mean
+            (e.g. "Published: 2026-08-17", "Saved: 2026-08-19", "Indexed: 2026-08-19").
+            Kindle results carry no date. When any filter (date, tag, author, domain)
+            is in effect, every result returned genuinely satisfies it: collections
+            with no matches contribute nothing rather than falling back, and
+            collections lacking the filtered field entirely are skipped. A note is
+            prepended naming any collection skipped and why. If nothing matched, that
+            is reported explicitly, naming the filters applied — do not substitute
+            results that fall outside them or present them as if they matched.
             NOTE: Results labeled as an AI-generated summary are a recall aid, not the
             source itself — never cite their wording as fact; fetch the real content via
             get_full_document() using the result's Source file/Source type fields first.
         """
+        from datetime import datetime, timedelta, timezone
         from qdrant_client import QdrantClient
         from openai import OpenAI
+
+        if sort not in ("relevance", "recent"):
+            return f"Unknown sort: {sort}. Valid options: relevance, recent"
+
+        if days and days > 0 and not date_from and not date_to:
+            date_from = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
 
         # Emit status
         if __event_emitter__:
@@ -1359,20 +1726,43 @@ class Tools:
             from qdrant_client.models import Filter as QFilter
 
             all_results = []
+            empty_filter_collections = []
+            skipped_collections = []  # (collection, reason) — lacks a filtered field
+            failed_collections = []
+
+            # An explicit date window means the caller cares about the window.
+            # Likewise an author/domain filter. In either case a collection that
+            # cannot satisfy the filter sits out rather than contributing
+            # unfiltered results — otherwise non-matching material competes for
+            # (and wins) the TOP_K budget, crowding out what was actually asked for.
+            window_requested = bool(date_from or date_to)
 
             for coll_name in collections:
-                fetch_limit = self.valves.TOP_K * 3
+                fetch_limit = self.valves.TOP_K * (10 if sort == "recent" else 3)
                 date_filter = self._build_date_filter(coll_name, date_from, date_to, date_mode)
                 tag_cond = self._build_tag_condition(coll_name, tag) if tag else None
+                author_cond = self._build_author_condition(coll_name, author) if author else None
+                domain_cond = self._build_domain_condition(coll_name, domain) if domain else None
 
-                if date_filter and tag_cond:
-                    combined_filter = QFilter(must=[*date_filter.must, tag_cond])
-                elif tag_cond:
-                    combined_filter = QFilter(must=[tag_cond])
+                # A collection lacking a filtered field can never satisfy the
+                # request (e.g. Kindle has no dates; podcasts have no author).
+                if window_requested and date_filter is None:
+                    skipped_collections.append((coll_name, "no date field"))
+                    continue
+                if author and author_cond is None:
+                    skipped_collections.append((coll_name, "no author field"))
+                    continue
+                if domain and domain_cond is None:
+                    skipped_collections.append((coll_name, "no publication-source field"))
+                    continue
+
+                conditions = [c for c in (date_filter, tag_cond, author_cond, domain_cond) if c is not None]
+                if len(conditions) > 1:
+                    combined_filter = QFilter(must=conditions)
+                elif conditions:
+                    combined_filter = conditions[0]
                 else:
-                    combined_filter = date_filter  # may be None
-                # Fallback omits date but keeps tag (if any)
-                fallback_filter = QFilter(must=[tag_cond]) if tag_cond else None
+                    combined_filter = None
 
                 results = None
                 try:
@@ -1382,46 +1772,27 @@ class Tools:
                         query_filter=combined_filter,
                         limit=fetch_limit
                     )
-                    # If the date filter produced no results, retry without it so the
-                    # collection still contributes its best semantic matches
-                    if not results.points and date_filter is not None:
-                        results = qdrant.query_points(
-                            collection_name=coll_name,
-                            query=query_vector,
-                            query_filter=fallback_filter,
-                            limit=fetch_limit
-                        )
+                    if not results.points and combined_filter is not None:
+                        empty_filter_collections.append(coll_name)
                 except Exception as e:
-                    if date_filter is not None:
-                        # Filtered query failed — retry without the date filter
-                        try:
-                            results = qdrant.query_points(
-                                collection_name=coll_name,
-                                query=query_vector,
-                                query_filter=fallback_filter,
-                                limit=fetch_limit
-                            )
-                        except Exception as e2:
-                            if __event_emitter__:
-                                await __event_emitter__({
-                                    "type": "status",
-                                    "data": {"description": f"Warning: Could not search {coll_name}: {e2}"}
-                                })
-                    else:
-                        if __event_emitter__:
-                            await __event_emitter__({
-                                "type": "status",
-                                "data": {"description": f"Warning: Could not search {coll_name}: {e}"}
-                            })
+                    if __event_emitter__:
+                        await __event_emitter__({
+                            "type": "status",
+                            "data": {"description": f"Warning: Could not search {coll_name}: {e}"}
+                        })
+                    failed_collections.append(coll_name)
                 if results is not None:
                     for point in results.points:
                         point._collection_name = coll_name
                     all_results.extend(results.points)
 
             # Diversified top-K: respect per-article limits while filling total budget
-            all_results.sort(key=lambda x: x.score, reverse=True)
+            if sort == "recent":
+                all_results.sort(key=self._recency_ts, reverse=True)
+            else:
+                all_results.sort(key=lambda x: x.score, reverse=True)
 
-            if self.valves.COHERE_API_KEY and all_results:
+            if sort != "recent" and self.valves.COHERE_API_KEY and all_results:
                 if __event_emitter__:
                     await __event_emitter__({
                         "type": "status",
@@ -1441,7 +1812,40 @@ class Tools:
             )
 
             if not top_results:
-                return "No relevant information found in the knowledge base."
+                applied = []
+                if author:
+                    applied.append(f'author="{author}"')
+                if domain:
+                    applied.append(f'domain="{domain}"')
+                if tag:
+                    applied.append(f'tag="{tag}"')
+                if window_requested:
+                    applied.append(
+                        f"date {date_from or 'inception'} to {date_to or 'now'} "
+                        f"(date_mode='{date_mode}')"
+                    )
+                if not applied:
+                    return "No relevant information found in the knowledge base."
+
+                msg = f"No results matching: {'; '.join(applied)}."
+                if author or domain:
+                    msg += (
+                        " Author and domain match stored metadata exactly (allowing for"
+                        " www./m. host variants and title-casing), so a value that differs"
+                        " from how it was indexed will exclude everything. If you expected"
+                        " matches, try the filters one at a time to isolate which one is"
+                        " responsible, or drop them and use the date window alone."
+                    )
+                else:
+                    msg += (
+                        " The content may exist outside this window. Widen or drop the"
+                        " date range to check."
+                    )
+                msg += (
+                    " Do not substitute results that fall outside these filters or"
+                    " present them as if they matched."
+                )
+                return msg
 
             # Format results
             context_parts = []
@@ -1480,8 +1884,6 @@ class Tools:
                         f"Feed: {payload.get('feed_name', payload.get('feed_url', 'Unknown Feed'))}\n"
                         f"URL: {payload.get('url', 'N/A')}"
                     )
-                    if payload.get('published'):
-                        header += f"\nPublished: {payload['published']}"
                     if payload.get('author'):
                         header += f"\nAuthor: {payload['author']}"
                     if payload.get('tags'):
@@ -1545,8 +1947,8 @@ class Tools:
                                 val = ', '.join(str(v) for v in val)
                             header += f"\n{key.title()}: {val}"
 
-                if payload.get('published_at') and '\nPublished:' not in header:
-                    header += f"\nPublished: {payload['published_at']}"
+                for line in self._date_lines(payload, source):
+                    header += f"\n{line}"
 
                 text = payload.get('text', '')
                 context_parts.append(f"{header}\n\n{text}\n\n---")
@@ -1557,7 +1959,26 @@ class Tools:
                     "data": {"description": f"Found {len(top_results)} relevant results"}
                 })
 
-            return "\n\n".join(context_parts)
+            notes = []
+            if empty_filter_collections:
+                notes.append(
+                    f"_Note: no matches for the requested filters in: "
+                    f"{', '.join(empty_filter_collections)}. Those collections "
+                    f"contributed nothing rather than falling back to non-matching "
+                    f"results — every result below genuinely satisfies the filters._"
+                )
+            if skipped_collections:
+                detail = ', '.join(f"{c} ({why})" for c, why in skipped_collections)
+                notes.append(
+                    f"_Note: skipped, cannot satisfy the requested filters: {detail}. "
+                    f"Drop the corresponding filter to include them._"
+                )
+            if failed_collections:
+                notes.append(
+                    f"_Note: could not search: {', '.join(failed_collections)}. "
+                    f"Results below are from the remaining collections only._"
+                )
+            return "\n\n".join(notes + context_parts)
 
         except Exception as e:
             error_msg = f"Error searching knowledge base: {str(e)}"
@@ -1639,7 +2060,7 @@ class Tools:
                 feed_cond = FieldCondition(key="feed_name", match=MatchValue(value=feed_name.strip()))
 
             if date_filter and feed_cond:
-                scroll_filter = QFilter(must=[*date_filter.must, feed_cond])
+                scroll_filter = QFilter(must=[date_filter, feed_cond])
             elif feed_cond:
                 scroll_filter = QFilter(must=[feed_cond])
             else:
@@ -1664,7 +2085,7 @@ class Tools:
                     truncated = True
                     break
 
-            articles = self._dedupe_feed_chunks(all_points)
+            articles = self._dedupe_chunks(all_points)
             articles.sort(key=lambda p: p.payload.get("published_ts", 0), reverse=True)
 
             if not articles:
@@ -1711,6 +2132,261 @@ class Tools:
 
         except Exception as e:
             error_msg = f"Error listing feed articles: {str(e)}"
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": error_msg}
+                })
+            return error_msg
+
+    async def list_recent_items(
+        self,
+        collection: str = "articles",
+        days: int = 7,
+        date_from: str = None,
+        date_to: str = None,
+        date_mode: str = "indexed",
+        tag: str = None,
+        source_type: str = None,
+        text_chars: int = None,
+        max_items: int = None,
+        __event_emitter__: Callable[[dict], None] = None,
+    ) -> str:
+        """
+        List every item in a single collection in a time window — complete
+        and deduplicated, with no ranking, categorization, or summarization
+        applied. Generalizes list_recent_feed_articles to Wallabag, podcasts,
+        and AI-generated summaries as well as feeds.
+
+        Use this instead of search_knowledge when you need an exhaustive
+        inventory of one collection for a time range (e.g. "everything I
+        saved to Wallabag this week", "every podcast I listened to in the
+        last 7 days") rather than a relevance-ranked subset. This is a plain
+        Qdrant payload listing (no query embedding, no OpenAI call, no
+        semantic ranking) — every matching item is returned exactly once,
+        sorted newest first. It does not categorize, cluster, or summarize
+        results; that is left entirely to the caller. Not available for
+        'kindle' — Kindle highlights have no date fields to window on; use
+        get_kindle_highlights or search_knowledge instead.
+
+        Args:
+            collection: Which collection to list:
+                        - 'articles' for Wallabag saved articles (default)
+                        - 'podcasts' for podcast transcripts
+                        - 'feeds' for RSS/Atom feed articles (for the
+                          feed_name filter and n8n-compatible output, prefer
+                          list_recent_feed_articles instead)
+                        - 'summaries' for AI-generated podcast/paper summaries
+                        - a specific document collection name (e.g. 'papers')
+            days: How many days back from today (UTC) to include, e.g. 7
+                  means the last week. Ignored if date_from or date_to is
+                  set. Default 7.
+            date_from: Optional explicit start of the window, ISO format
+                       (YYYY-MM-DD). Overrides `days` when set. If set
+                       without date_to, the window runs from date_from
+                       through now.
+            date_to: Optional explicit end of the window, ISO format
+                     (YYYY-MM-DD). Overrides `days` when set. If set without
+                     date_from, the window runs from the start of the
+                     collection through date_to.
+            date_mode: Which date concept to filter on:
+                       - 'indexed' (default) — when the item was added/saved
+                         to the knowledgebase. This is the right mode for
+                         "what did I save/listen to this week" questions,
+                         and always uses a reliably-populated timestamp
+                         (Wallabag's created_at, a podcast file's mtime,
+                         etc.) rather than a publication date that may be
+                         missing.
+                       - 'published' — article/episode publication date.
+                         Falls back to the item's ingest/save date when it
+                         has no publication date, so a "published" window
+                         still catches undated saved items instead of
+                         silently excluding them.
+            tag: Optional tag label to restrict results to (exact match,
+                 case-insensitive). Applies to Wallabag, feeds, podcasts,
+                 and summaries; unsupported for document collections (an
+                 error is returned rather than silently ignoring it).
+            source_type: For collection='summaries' only — 'podcast' or
+                         'paper', to restrict to summaries of one subtype.
+                         Omit for other collections (an error is returned if
+                         given, rather than silently ignoring it).
+            text_chars: Optional max characters to show from each item's
+                        body text, truncated with a trailing note. None
+                        (default) returns full text — a week of Wallabag
+                        saves at full text can be large, so pass this for a
+                        compact digest.
+            max_items: Optional cap on the number of items returned, applied
+                       after sorting so it keeps the most recent N rather
+                       than an arbitrary N. None (default) returns everything
+                       matched (subject to the internal raw-point safety
+                       valve below).
+
+        Returns:
+            A markdown list of every matching item — one entry per
+            article/episode/document, sorted newest first, with the same
+            per-source header fields search_knowledge uses (title, ID/URL,
+            tags, dates, etc.). Returns a plain "No items found" message if
+            nothing matches. Podcast dates are lower precision than other
+            sources: published_at (when present) is a date parsed from the
+            filename with no time component, and modified_at is the
+            transcript file's local modification time with no UTC offset —
+            so date-window edges can be off by a few hours for podcasts.
+        """
+        from datetime import datetime, timedelta, timezone
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Filter as QFilter, FieldCondition, MatchValue
+
+        SCROLL_PAGE_SIZE = 256
+        MAX_POINTS_SCROLLED = 20000  # safety valve, not a feature limit
+
+        collection_arg = (collection or "").strip()
+        doc_names = self._get_document_collection_names()
+
+        if collection_arg == "articles":
+            coll_name = self.valves.WALLABAG_COLLECTION
+        elif collection_arg == "podcasts":
+            coll_name = self.valves.PODCAST_COLLECTION
+        elif collection_arg == "feeds":
+            coll_name = self.valves.FEEDS_COLLECTION
+        elif collection_arg == "summaries":
+            coll_name = self.valves.SUMMARIES_COLLECTION
+        elif collection_arg == "kindle":
+            return (
+                "Error: list_recent_items does not support 'kindle' — Kindle highlights "
+                "have no date fields to window on. Use get_kindle_highlights(file_name) "
+                "for one book's full highlight set, or search_knowledge(collection="
+                "'kindle', ...) to search across all of them."
+            )
+        elif collection_arg in doc_names:
+            coll_name = collection_arg
+        else:
+            valid = ["articles", "podcasts", "feeds", "summaries"] + doc_names
+            return (
+                f"Unknown collection: {collection_arg}. Valid options: {', '.join(valid)} "
+                f"('kindle' unsupported — see docstring)."
+            )
+
+        if date_mode not in ("published", "indexed"):
+            return f"Unknown date_mode: {date_mode}. Valid options: published, indexed"
+
+        if source_type:
+            if coll_name != self.valves.SUMMARIES_COLLECTION:
+                return (
+                    f"Error: source_type is only applicable to collection='summaries' "
+                    f"(got collection='{collection_arg}'). Omit source_type for other collections."
+                )
+            source_type = source_type.strip().lower()
+            if source_type not in ("podcast", "paper"):
+                return f"Error: source_type must be 'podcast' or 'paper', got '{source_type}'."
+
+        tag_cond = None
+        if tag:
+            tag_cond = self._build_tag_condition(coll_name, tag)
+            if tag_cond is None:
+                return f"Error: tag filtering is not supported for collection='{collection_arg}'."
+
+        if not date_from and not date_to:
+            date_from = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Listing {collection_arg} from {date_from or 'inception'} to {date_to or 'now'}..."}
+            })
+
+        try:
+            qdrant = QdrantClient(
+                url=self.valves.QDRANT_URL,
+                api_key=self.valves.QDRANT_API_KEY or None
+            )
+
+            date_filter = self._build_date_filter(coll_name, date_from, date_to, date_mode)
+            source_type_cond = (
+                FieldCondition(key="source_type", match=MatchValue(value=source_type))
+                if source_type else None
+            )
+
+            conditions = [c for c in (date_filter, tag_cond, source_type_cond) if c is not None]
+            if len(conditions) > 1:
+                scroll_filter = QFilter(must=conditions)
+            elif conditions:
+                scroll_filter = conditions[0]
+            else:
+                scroll_filter = None
+
+            all_points = []
+            next_offset = None
+            truncated = False
+            while True:
+                page_points, next_offset = qdrant.scroll(
+                    collection_name=coll_name,
+                    scroll_filter=scroll_filter,
+                    limit=SCROLL_PAGE_SIZE,
+                    offset=next_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                all_points.extend(page_points)
+                if next_offset is None:
+                    break
+                if len(all_points) >= MAX_POINTS_SCROLLED:
+                    truncated = True
+                    break
+
+            items = self._dedupe_chunks(all_points)
+            items.sort(key=self._recency_ts, reverse=True)
+
+            if not items:
+                window_desc = f"{date_from or 'the start of the collection'} to {date_to or 'now'}"
+                filters_desc = []
+                if tag:
+                    filters_desc.append(f"tag='{tag}'")
+                if source_type:
+                    filters_desc.append(f"source_type='{source_type}'")
+                filters_suffix = f" ({', '.join(filters_desc)})" if filters_desc else ""
+                return f"No items found in collection='{collection_arg}'{filters_suffix} between {window_desc}."
+
+            total_matched = len(items)
+            capped = bool(max_items and max_items > 0 and len(items) > max_items)
+            if capped:
+                items = items[:max_items]
+
+            blocks = []
+            for point in items:
+                payload = point.payload
+                source = payload.get("source", "unknown")
+                header = self._format_recent_item_header(payload, source, collection_name=coll_name)
+                text = payload.get('text', '')
+                if text_chars and text_chars > 0 and len(text) > text_chars:
+                    original_len = len(text)
+                    text = text[:text_chars].rstrip() + f"\n\n_(truncated to {text_chars} of {original_len} characters)_"
+                blocks.append(f"{header}\n\n{text}\n\n---")
+
+            heading = f"## Recent Items — {collection_arg} ({len(items)} shown)"
+            result = heading + "\n\n" + "\n\n".join(blocks)
+
+            if truncated:
+                result += (
+                    f"\n\n_(Stopped after scanning {MAX_POINTS_SCROLLED} raw points; "
+                    f"the window may contain more items — narrow the date range or "
+                    f"tag filter to see all of them.)_"
+                )
+            if capped:
+                result += (
+                    f"\n\n_(Showing the {max_items} most recent of {total_matched} matching "
+                    f"items; increase max_items or narrow the date range to see more.)_"
+                )
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Found {total_matched} items in {collection_arg}"}
+                })
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error listing items: {str(e)}"
             if __event_emitter__:
                 await __event_emitter__({
                     "type": "status",
