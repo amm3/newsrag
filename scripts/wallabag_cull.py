@@ -10,14 +10,13 @@ import sys
 import os
 import argparse
 import logging
-import time
 import warnings
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
 from alert import send_alert
+from wallabag_client import WallabagClient
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
@@ -29,68 +28,6 @@ def log_fatal(msg: str):
     logging.error(msg)
     send_alert("wallabag-cull fatal error", msg)
     sys.exit(1)
-
-
-class WallabagClient:
-    """Simple Wallabag API client"""
-
-    def __init__(self, url, client_id, client_secret, username, password):
-        self.url = url.rstrip('/')
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.username = username
-        self.password = password
-        self.token = None
-        self.token_expires = 0
-
-    def _get_token(self):
-        """Get or refresh OAuth token"""
-        if self.token and time.time() < self.token_expires:
-            return self.token
-
-        logging.debug("Requesting new OAuth token from Wallabag")
-        resp = requests.post(f"{self.url}/oauth/v2/token", data={
-            'grant_type': 'password',
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'username': self.username,
-            'password': self.password
-        })
-        resp.raise_for_status()
-        data = resp.json()
-
-        self.token = data['access_token']
-        self.token_expires = time.time() + data.get('expires_in', 3600) - 60
-        return self.token
-
-    def get_entries(self, per_page=30):
-        """Fetch all entries (paginated), returning full entry dicts"""
-        token = self._get_token()
-        headers = {'Authorization': f'Bearer {token}'}
-
-        all_entries = []
-        page = 1
-
-        while True:
-            params = {'perPage': per_page, 'page': page}
-            logging.debug(f"Fetching page {page} from Wallabag API")
-            resp = requests.get(f"{self.url}/api/entries.json",
-                                headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-            items = data.get('_embedded', {}).get('items', [])
-            if not items:
-                break
-
-            all_entries.extend(items)
-            logging.debug(f"Page {page}: retrieved {len(items)} entries")
-
-            if page >= data.get('pages', 1):
-                break
-            page += 1
-
-        return all_entries
 
 
 def main():

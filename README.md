@@ -241,6 +241,18 @@ touches Qdrant, and never overwrites an existing `.ai-summary.md` file
 unless you pass `--regenerate` or `--files` — so you can hand-edit a
 summary and it's safe from routine re-runs.
 
+If the source file's own header already lists `tags`, they're carried
+forward unchanged. If it doesn't, the LLM proposes a handful alongside the
+summary, guided by two things: the tag naming conventions (hyphenated
+multi-word concepts, space-separated person names, bare acronyms) and the
+tag vocabulary already in use — pulled live from Wallabag's `/api/tags.json`
+so generated tags line up with the ones applied by hand. Proposed tags that
+differ from an existing tag only in punctuation are snapped to the Wallabag
+spelling. The lookup is best-effort: without Wallabag credentials, or if the
+server is unreachable, summaries are still generated and tags simply follow
+the conventions alone. `SUMMARY_TAG_VOCAB_LIMIT` caps how many tags go into
+the prompt (`0` disables the lookup, as does `--no-tag-vocab`).
+
 **Phase 2 — load.** Scans for `.ai-summary.md` files and embeds/upserts
 them into the `summaries` collection, tagged with `source_type` (`podcast`
 or `paper`). Re-running after you hand-edit a summary picks up the change
@@ -257,6 +269,9 @@ uses.
 
 # Regenerate specific source files
 ./run.sh summarize --type paper --files /path/to/paper.md -v
+
+# Propose tags from the naming conventions only, without the Wallabag tag list
+./run.sh summarize --type paper --papers-dir /path/to/papers --no-tag-vocab -v
 
 # Phase 2: embed and load summaries into Qdrant (cheap — embeddings only)
 ./run.sh summaries --podcast-dir /path/to/podcasts --papers-dir /path/to/papers -v
@@ -552,6 +567,7 @@ qdrant_loader/
 │   └── feeds.yaml            # Your feed list (git-ignored)
 └── scripts/
     ├── wallabag_ingest.py    # Wallabag article ingestion
+    ├── wallabag_client.py    # Shared Wallabag API client
     ├── podcast_ingest.py     # Podcast transcript ingestion
     ├── papers_ingest.py      # Papers/document ingestion
     ├── summarize.py          # AI summary generation (Phase 1, no Qdrant writes)
@@ -573,7 +589,8 @@ OpenAI `text-embedding-3-small` pricing: $0.02 per 1M tokens
 
 AI summary generation (`./run.sh summarize`) additionally makes one chat-completion
 call per file, at `SUMMARY_MODEL` pricing — check current OpenAI pricing before
-running it over a large backlog. Loading summaries into Qdrant (`./run.sh summaries`)
+running it over a large backlog. It also makes one free Wallabag `/api/tags.json`
+call per run to load the tag vocabulary. Loading summaries into Qdrant (`./run.sh summaries`)
 is embeddings-only and costs the same negligible amount as any other incremental sync.
 
 ---

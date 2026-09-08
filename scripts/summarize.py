@@ -9,7 +9,9 @@ url, published_at, tags, plus generation provenance).
 
 If the source file's header already has tags, they're carried forward as-is.
 If not, the LLM is asked to infer a handful of topic tags from the content
-alongside the summary.
+alongside the summary, following the tag naming conventions and preferring the
+tag vocabulary already in use (pulled from Wallabag when it's configured, so
+generated tags stay consistent with hand-applied ones).
 
 This script never touches Qdrant. Run summaries_ingest.py (Phase 2) to load
 generated (or hand-edited) summaries into the 'summaries' collection.
@@ -32,6 +34,7 @@ from dotenv import load_dotenv
 
 from alert import send_alert
 from openai import OpenAI
+from wallabag_client import WallabagClient
 
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOGGING_FORMAT = '%(asctime)s:%(levelname)s:%(message)s'
@@ -80,7 +83,7 @@ SUMMARY_WITH_TAGS_SYSTEM_PROMPT = {
         "the conversation, e.g. 'the interview opens with' - state each idea directly; a "
         "few thematic bullet points or short paragraphs, no title or heading) and \"tags\" "
         "(a list of 3-6 short, lowercase topic tags describing the episode's subject "
-        "matter, e.g. [\"economy\", \"politics\"])."
+        "matter)."
     ),
     'paper': (
         "You summarize research papers and documents for a semantic search index, not a "
@@ -93,9 +96,122 @@ SUMMARY_WITH_TAGS_SYSTEM_PROMPT = {
         "document's structure, e.g. 'the paper then discusses' - state each idea directly; "
         "a few thematic bullet points or short paragraphs, no title or heading) and "
         "\"tags\" (a list of 3-6 short, lowercase topic tags describing the paper's "
-        "subject matter, e.g. [\"machine-learning\", \"nlp\"])."
+        "subject matter)."
     ),
 }
+
+# The user's hand-maintained tag conventions. Appended to the tag prompt above so
+# AI-proposed tags are spelled the same way the manually applied ones are.
+TAG_CONVENTIONS = (
+    "\n\nFollow these tag naming conventions exactly:\n"
+    "- Multi-word concepts and topics are hyphenated: "
+    "ranked-choice-voting, supply-chain-attack, mental-health\n"
+    "- Named persons are space-separated: ben sasse, pete hegseth, marco rubio\n"
+    "- Common acronyms and initialisms are used as-is: "
+    "ai, nato, scotus, fbi, doj, irs, tsa, cisa, crt, maga\n"
+    "- Every tag is lowercase, and no tag may contain a comma."
+)
+
+MAX_AI_TAGS = 6
+DEFAULT_TAG_VOCAB_LIMIT = 300
+
+
+def build_tag_system_prompt(content_type: str, vocabulary: list[str]) -> str:
+    """Base tag prompt + the naming conventions + the in-use tag vocabulary."""
+    prompt = SUMMARY_WITH_TAGS_SYSTEM_PROMPT[content_type] + TAG_CONVENTIONS
+    if vocabulary:
+        prompt += (
+            "\n\nThis is the tag vocabulary already in use across the library. Prefer "
+            "reusing one of these verbatim whenever it fits the subject matter; only coin "
+            "a new tag when nothing here covers it, and follow the conventions above when "
+            "you do:\n" + ', '.join(vocabulary)
+        )
+    return prompt
+
+
+def slug_key(tag: str) -> str:
+    """Punctuation-insensitive key, so 'mental health' and 'mental-health' collide."""
+    return re.sub(r'[\s_-]+', '-', tag)
+
+
+def load_tag_vocabulary(limit: int, enabled: bool = True) -> tuple[list[str], dict[str, str]]:
+    """
+    Fetch the in-use Wallabag tags to steer (and normalize) AI-proposed tags.
+
+    Entirely best-effort: summarize.py only requires OPENAI_API_KEY, so missing
+    Wallabag credentials or an unreachable server just means no vocabulary, never
+    a failed run.
+
+    Returns (labels for the prompt, slug -> canonical label).
+    """
+    if not enabled or limit <= 0:
+        logging.debug("Wallabag tag vocabulary disabled")
+        return [], {}
+
+    wallabag_vars = ['WALLABAG_URL', 'WALLABAG_CLIENT_ID', 'WALLABAG_CLIENT_SECRET',
+                     'WALLABAG_USERNAME', 'WALLABAG_PASSWORD']
+    missing = [v for v in wallabag_vars if not os.environ.get(v)]
+    if missing:
+        logging.info(
+            f"Skipping the Wallabag tag vocabulary, missing: {', '.join(missing)}. "
+            f"Tags will follow the naming conventions but won't be matched against "
+            f"existing tags."
+        )
+        return [], {}
+
+    try:
+        wallabag = WallabagClient(
+            url=os.environ['WALLABAG_URL'],
+            client_id=os.environ['WALLABAG_CLIENT_ID'],
+            client_secret=os.environ['WALLABAG_CLIENT_SECRET'],
+            username=os.environ['WALLABAG_USERNAME'],
+            password=os.environ['WALLABAG_PASSWORD'],
+        )
+        raw_tags = wallabag.get_tags()
+    except Exception as e:
+        logging.warning(f"Could not load the Wallabag tag vocabulary ({e}), continuing without it")
+        return [], {}
+
+    tags = [t for t in raw_tags if isinstance(t, dict) and str(t.get('label', '')).strip()]
+
+    if len(tags) > limit:
+        # /api/tags.json carries no usage counts, so fall back to tag id as a
+        # recency proxy and keep the most recently created ones.
+        logging.warning(
+            f"Wallabag returned {len(tags)} tags, capping the prompt vocabulary at "
+            f"{limit} (most recent by tag id); raise SUMMARY_TAG_VOCAB_LIMIT to include more"
+        )
+        tags = sorted(tags, key=lambda t: t.get('id', 0), reverse=True)[:limit]
+
+    by_slug = {}
+    for tag in tags:
+        label = str(tag['label']).strip().lower()
+        by_slug.setdefault(slug_key(label), label)
+
+    labels = sorted(by_slug.values())
+    logging.info(f"Loaded {len(labels)} Wallabag tag(s) as the tag vocabulary")
+    logging.debug(f"Tag vocabulary: {', '.join(labels)}")
+    return labels, by_slug
+
+
+def normalize_tags(raw_tags, by_slug: dict[str, str]) -> list[str]:
+    """
+    Clean up model-proposed tags and snap them onto the existing vocabulary.
+
+    Lowercases, splits any comma-bearing tag (a comma would break the
+    comma-joined header round-trip), rewrites punctuation variants to the
+    spelling Wallabag already uses, dedupes, and caps the count.
+    """
+    normalized = []
+    for raw in raw_tags or []:
+        for part in str(raw).split(','):
+            tag = re.sub(r'\s+', ' ', part).strip().lower()
+            if not tag:
+                continue
+            tag = by_slug.get(slug_key(tag), tag)
+            if tag not in normalized:
+                normalized.append(tag)
+    return normalized[:MAX_AI_TAGS]
 
 
 def main():
@@ -111,6 +227,7 @@ def main():
     parser.add_argument("--regenerate", action="store_true", help="Overwrite existing .ai-summary.md files found during discovery")
     parser.add_argument("--limit", type=int, default=None, help="Cap the number of summaries generated this run")
     parser.add_argument("--dry-run", action="store_true", help="Don't call the LLM or write files")
+    parser.add_argument("--no-tag-vocab", action="store_true", help="Don't pull the in-use tag list from Wallabag when proposing tags")
     parser.add_argument("-v", action="store_true", default=False, help="Print extra info")
     parser.add_argument("-vv", action="store_true", default=False, help="Print (more) extra info")
     args = parser.parse_args()
@@ -130,6 +247,10 @@ def main():
 
     model = os.environ.get('SUMMARY_MODEL', 'gpt-5-mini')
     max_input_chars = int(os.environ.get('SUMMARY_MAX_INPUT_CHARS', 100000))
+    tag_vocab_limit = int(os.environ.get('SUMMARY_TAG_VOCAB_LIMIT', DEFAULT_TAG_VOCAB_LIMIT))
+
+    # Best-effort; an empty vocabulary just means tags rely on the conventions alone
+    tag_vocab, tag_by_slug = load_tag_vocabulary(tag_vocab_limit, enabled=not args.no_tag_vocab)
 
     dir_arg = args.podcast_dir if args.type == 'podcast' else args.papers_dir
     root_dir = Path(dir_arg) if dir_arg else None
@@ -181,7 +302,8 @@ def main():
     generated = 0
     for i, source_path in enumerate(candidates, 1):
         try:
-            if process_source(source_path, root_dir, args.type, openai_client, model, max_input_chars, args.dry_run):
+            if process_source(source_path, root_dir, args.type, openai_client, model, max_input_chars,
+                              tag_vocab, tag_by_slug, args.dry_run):
                 generated += 1
                 logging.info(f"[{i}/{len(candidates)}] Summarized: {source_path.name}")
         except Exception as e:
@@ -306,12 +428,13 @@ def generate_summary(body: str, openai_client: OpenAI, model: str, content_type:
     return response.choices[0].message.content.strip()
 
 
-def generate_summary_with_tags(body: str, openai_client: OpenAI, model: str, content_type: str) -> tuple[str, list[str]]:
+def generate_summary_with_tags(body: str, openai_client: OpenAI, model: str, content_type: str,
+                               tag_vocab: list[str], tag_by_slug: dict[str, str]) -> tuple[str, list[str]]:
     """Like generate_summary, but also asks the model to propose topic tags (JSON mode)."""
     response = openai_client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": SUMMARY_WITH_TAGS_SYSTEM_PROMPT[content_type]},
+            {"role": "system", "content": build_tag_system_prompt(content_type, tag_vocab)},
             {"role": "user", "content": body},
         ],
         response_format={"type": "json_object"},
@@ -320,9 +443,7 @@ def generate_summary_with_tags(body: str, openai_client: OpenAI, model: str, con
     summary = str(data.get("summary", "")).strip()
     if not summary:
         raise ValueError("Model returned an empty summary")
-    raw_tags = data.get("tags") or []
-    tags = [str(t).strip().lower() for t in raw_tags if str(t).strip()]
-    return summary, tags
+    return summary, normalize_tags(data.get("tags"), tag_by_slug)
 
 
 def format_header(fields: dict) -> str:
@@ -346,6 +467,7 @@ def write_summary_file(summary_path: Path, header_fields: dict, body: str):
 
 def process_source(source_path: Path, root_dir: Path | None, source_type: str,
                     openai_client: OpenAI, model: str, max_input_chars: int,
+                    tag_vocab: list[str], tag_by_slug: dict[str, str],
                     dry_run: bool = False) -> bool:
     """Generate and write a .ai-summary.md sibling for one source file."""
     summary_path = source_path.with_suffix('.ai-summary.md')
@@ -390,7 +512,9 @@ def process_source(source_path: Path, root_dir: Path | None, source_type: str,
     try:
         if needs_ai_tags:
             try:
-                summary_text, tags = generate_summary_with_tags(truncated_body, openai_client, model, source_type)
+                summary_text, tags = generate_summary_with_tags(
+                    truncated_body, openai_client, model, source_type, tag_vocab, tag_by_slug
+                )
             except Exception as e:
                 logging.warning(f"{source_path.name}: AI tag generation failed ({e}), falling back to a plain summary with no tags")
                 summary_text = generate_summary(truncated_body, openai_client, model, source_type)
