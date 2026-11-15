@@ -35,7 +35,8 @@ from qdrant_client.models import (
     Filter, FieldCondition, MatchValue, PayloadSchemaType
 )
 
-from alert import send_alert
+from alert import send_alert, run_guarded
+from sync_state import claim_state, stamp_last_sync, write_state
 
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOGGING_FORMAT = '%(asctime)s:%(levelname)s:%(message)s'
@@ -83,6 +84,16 @@ def main():
 
     # State file location
     state_file = config_dir / '.openwebui_sync_state.json'
+
+    # Another run may already be working on this file: cron fires on a timer
+    # whether or not the last run finished, and a run started by hand knows
+    # nothing of either. Racing would lose one of the two runs' state.
+    # The claim mirrors this loader's state-write condition exactly: a
+    # targeted reprocess writes no state, so it neither needs the lock nor
+    # should be turned away by one.
+    if not args.dry_run and not args.chats \
+            and not claim_state(state_file):
+        return 0
 
     # Initialize clients
     owui = OpenWebUIClient(
@@ -138,6 +149,11 @@ def main():
 
         if not all_chats_meta:
             logging.info("No new or updated chats to process")
+            # The run completed, it just had nothing to do. Stamp it anyway:
+            # last_sync has to mean 'a run finished' for health_check.py to
+            # tell a quiet source from a broken one.
+            if not args.dry_run and not args.chats:
+                stamp_last_sync(state_file)
             return 0
 
         # Fetch full chat details
@@ -172,8 +188,7 @@ def main():
 
     # Save state (skip for targeted reprocessing or dry-run)
     if not args.dry_run and not args.chats:
-        with open(state_file, 'w') as f:
-            json.dump({'last_sync': datetime.now(timezone.utc).isoformat()}, f)
+        write_state(state_file, {'last_sync': datetime.now(timezone.utc).isoformat()})
 
     logging.warning(f"Completed: {len(chats)} chats, {total_points} message points indexed")
     return 0
@@ -481,7 +496,4 @@ def log_fatal(msg, exit_code=-1):
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(1)
+    sys.exit(run_guarded('openwebui_chat_loader', main))

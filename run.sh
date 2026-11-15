@@ -8,9 +8,12 @@
 #   ./run.sh [options] wallabag [options]      - Run Wallabag ingestion
 #   ./run.sh [options] podcasts [options]      - Run podcast transcript ingestion
 #   ./run.sh [options] papers [options]        - Run papers/documents ingestion
+#   ./run.sh [options] papers-cull [options]   - Remove Qdrant chunks of documents gone from a papers dir
 #   ./run.sh [options] summarize [options]     - Generate AI summaries (Phase 1)
 #   ./run.sh [options] summaries [options]     - Load AI summaries into Qdrant (Phase 2)
+#   ./run.sh [options] summaries-cull [options] - Remove Qdrant chunks of deleted AI summaries
 #   ./run.sh [options] feeds [options]         - Run RSS/Atom feed ingestion
+#   ./run.sh [options] health [options]        - Alert if an ingest source has gone stale
 #   ./run.sh help                              - Show this help
 #
 # The command name can appear anywhere in the argument list.
@@ -54,10 +57,13 @@ Commands:
   wallabag-cull Remove orphaned Qdrant entries for deleted Wallabag articles
   podcasts      Ingest podcast transcripts from filesystem
   papers        Ingest papers/documents from filesystem
+  papers-cull   Remove Qdrant chunks of documents deleted or renamed in a papers dir
   summarize     Generate AI summaries for podcasts/papers (Phase 1, writes .ai-summary.md files)
   summaries     Load AI summaries into Qdrant (Phase 2, reads .ai-summary.md files)
+  summaries-cull Remove Qdrant chunks of .ai-summary.md files that were deleted
   kindle        Ingest Kindle highlights from Bookcision JSON exports
   openwebui     Ingest chat history from OpenWebUI
+  health        Alert if an ingest source has stopped syncing
   help          Show this help message
 
 Wallabag Options:
@@ -88,6 +94,15 @@ Papers Options:
   -v                   Verbose output
   -vv                  Debug output
 
+Papers-Cull Options (run with the same --papers-dir/--collection as 'papers'):
+  --papers-dir PATH    Directory the collection is ingested from (required)
+  --collection NAME    Qdrant collection name (default: 'papers')
+  --force              Cull even if the directory looks unmounted or mostly gone
+  --dry-run            List what would be removed; change nothing
+  --self-test          Check the cull rules against an in-memory Qdrant and exit
+  -v                   Verbose output (lists each file removed)
+  -vv                  Debug output
+
 Summarize Options (Phase 1 - generate .ai-summary.md files, no Qdrant writes):
   --type {podcast,paper}  Content type to summarize (required)
   --podcast-dir PATH      Directory containing podcasts (used with --type podcast)
@@ -108,11 +123,22 @@ Summaries Options (Phase 2 - load .ai-summary.md files into Qdrant):
   -v                   Verbose output
   -vv                  Debug output
 
+Summaries-Cull Options (run with the same dirs as 'summaries'; only those roots are culled):
+  --podcast-dir PATH   Directory containing podcasts
+  --papers-dir PATH    Directory containing papers/documents
+  --collection NAME    Qdrant collection name (default: 'summaries')
+  --force              Cull even if a directory looks unmounted or mostly gone
+  --dry-run            List what would be removed; change nothing
+  --self-test          Check the cull rules against an in-memory Qdrant and exit
+  -v                   Verbose output (lists each file removed)
+  -vv                  Debug output
+
 Feeds Options:
   --feeds URL [URL ...]  Reprocess specific feed URLs only
   --config PATH          Path to feeds YAML config (default: config/feeds.yaml)
   --full                 Full re-sync (ignore state file)
   --dry-run              Don't write to Qdrant
+  --self-test            Check the sync-state rules against known cases and exit
   -v                     Verbose output
   -vv                    Debug output
 
@@ -131,6 +157,15 @@ OpenWebUI Options:
   -v                       Verbose output
   -vv                      Debug output
 
+Health Options (checks each source's state file for a recent completed sync):
+  --force      Alert about every problem found, ignoring HEALTH_REALERT_HOURS
+  --dry-run    Report findings without sending mail or recording them
+  -v           Verbose output
+  -vv          Debug output
+
+  Configured in config/.env via HEALTH_CHECKS, HEALTH_STALE_HOURS and
+  HEALTH_REALERT_HOURS. Exits non-zero when a source is stale.
+
 Examples:
   ./run.sh wallabag -v
   ./run.sh wallabag --entries 1234 5678 -v
@@ -141,10 +176,12 @@ Examples:
   ./run.sh papers --papers-dir /mnt/nas/papers -v
   ./run.sh papers --papers-dir /mnt/nas/papers --collection my-papers -v
   ./run.sh papers --papers-dir /mnt/nas/papers --full -v
+  ./run.sh papers-cull --papers-dir /mnt/nas/papers --collection my-papers --dry-run -v
   ./run.sh summarize --type podcast --podcast-dir /mnt/nas/podcasts -v
   ./run.sh summarize --type paper --papers-dir /mnt/nas/papers -v
   ./run.sh summarize --type podcast --podcast-dir /mnt/nas/podcasts --regenerate -v
   ./run.sh summaries --podcast-dir /mnt/nas/podcasts --papers-dir /mnt/nas/papers -v
+  ./run.sh summaries-cull --podcast-dir /mnt/nas/podcasts --papers-dir /mnt/nas/papers --dry-run -v
   ./run.sh feeds -v
   ./run.sh feeds --full --dry-run -v
   ./run.sh feeds --feeds https://example.com/feed.rss -v
@@ -153,13 +190,15 @@ Examples:
   ./run.sh openwebui -v
   ./run.sh openwebui --full --dry-run -v
   ./run.sh openwebui --chats abc123 def456 -v
+  ./run.sh health -v
+  ./run.sh health --dry-run -v
 
 State files are stored in $CONFIG_DIR/
 Delete them to force a full re-sync.
 EOF
 }
 
-KNOWN_COMMANDS=(wallabag wallabag-cull cull podcasts podcast papers paper summarize summaries feeds feed kindle openwebui owui help --help -h)
+KNOWN_COMMANDS=(wallabag wallabag-cull cull podcasts podcast papers paper papers-cull summarize summaries summaries-cull feeds feed kindle openwebui owui health help --help -h)
 
 COMMAND=""
 REMAINING=()
@@ -190,11 +229,17 @@ case "$COMMAND" in
     papers|paper)
         exec python "$SCRIPT_DIR/scripts/papers_ingest.py" "${REMAINING[@]}"
         ;;
+    papers-cull)
+        exec python "$SCRIPT_DIR/scripts/papers_cull.py" "${REMAINING[@]}"
+        ;;
     summarize)
         exec python "$SCRIPT_DIR/scripts/summarize.py" "${REMAINING[@]}"
         ;;
     summaries)
         exec python "$SCRIPT_DIR/scripts/summaries_ingest.py" "${REMAINING[@]}"
+        ;;
+    summaries-cull)
+        exec python "$SCRIPT_DIR/scripts/summaries_cull.py" "${REMAINING[@]}"
         ;;
     feeds|feed)
         exec python "$SCRIPT_DIR/scripts/feeds_ingest.py" "${REMAINING[@]}"
@@ -204,6 +249,9 @@ case "$COMMAND" in
         ;;
     openwebui|owui)
         exec python "$SCRIPT_DIR/scripts/openwebui_chat_loader.py" "${REMAINING[@]}"
+        ;;
+    health)
+        exec python "$SCRIPT_DIR/scripts/health_check.py" "${REMAINING[@]}"
         ;;
     help|--help|-h)
         show_help

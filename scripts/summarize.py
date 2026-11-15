@@ -32,7 +32,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from alert import send_alert
+from alert import send_alert, run_guarded
 from openai import OpenAI
 from wallabag_client import WallabagClient
 
@@ -245,7 +245,7 @@ def main():
     if missing:
         log_fatal(f"Missing required environment variables: {', '.join(missing)}")
 
-    model = os.environ.get('SUMMARY_MODEL', 'gpt-5-mini')
+    model = os.environ.get('SUMMARY_MODEL', 'gpt-5.6-luna')
     max_input_chars = int(os.environ.get('SUMMARY_MAX_INPUT_CHARS', 100000))
     tag_vocab_limit = int(os.environ.get('SUMMARY_TAG_VOCAB_LIMIT', DEFAULT_TAG_VOCAB_LIMIT))
 
@@ -553,7 +553,4 @@ def log_fatal(msg, exit_code=-1):
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(1)
+    sys.exit(run_guarded('summarize', main))

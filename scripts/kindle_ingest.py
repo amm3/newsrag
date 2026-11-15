@@ -20,7 +20,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from alert import send_alert
+from alert import send_alert, run_guarded
+from sync_state import claim_state, stamp_last_sync, write_state
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -68,6 +69,16 @@ def main():
 
     # State file location
     state_file = config_dir / '.kindle_sync_state.json'
+
+    # Another run may already be working on this file: cron fires on a timer
+    # whether or not the last run finished, and a run started by hand knows
+    # nothing of either. Racing would lose one of the two runs' state.
+    # The claim mirrors this loader's state-write condition exactly: a
+    # targeted reprocess writes no state, so it neither needs the lock nor
+    # should be turned away by one.
+    if not args.dry_run and not args.files \
+            and not claim_state(state_file):
+        return 0
 
     # Initialize clients
     with warnings.catch_warnings():
@@ -122,6 +133,11 @@ def main():
 
     if not new_files:
         logging.info("No new Kindle export files to process")
+        # The run completed, it just had nothing to do. Stamp it anyway:
+        # last_sync has to mean 'a run finished' for health_check.py to
+        # tell a quiet source from a broken one.
+        if not args.dry_run and not args.files:
+            stamp_last_sync(state_file)
         return 0
 
     # Process files
@@ -142,11 +158,10 @@ def main():
     # Save state (skip for targeted reprocessing or dry-run)
     if not args.dry_run and not args.files:
         file_mtimes.update({p: int(Path(p).stat().st_mtime) for p in newly_processed})
-        with open(state_file, 'w') as f:
-            json.dump({
-                'file_mtimes': file_mtimes,
-                'last_sync': datetime.now(timezone.utc).isoformat()
-            }, f, indent=2)
+        write_state(state_file, {
+            'file_mtimes': file_mtimes,
+            'last_sync': datetime.now(timezone.utc).isoformat(),
+        })
 
     logging.warning(f"Completed: {len(newly_processed)} books, {total_highlights} highlights indexed")
     return 0
@@ -281,7 +296,4 @@ def log_fatal(msg, exit_code=-1):
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(1)
+    sys.exit(run_guarded('kindle_ingest', main))

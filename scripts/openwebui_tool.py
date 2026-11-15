@@ -58,7 +58,7 @@ source_file + source_type) before citing specifics.
 title: Qdrant Knowledge Search
 author: adam
 description: Search personal knowledge base (Wallabag articles, podcast transcripts, document collections, RSS/Atom feeds, Kindle highlights, and AI-generated summaries)
-version: 1.16.0
+version: 1.17.0
 """
 
 from typing import Callable
@@ -477,6 +477,7 @@ class Tools:
     async def get_articles_by_tag(
         self,
         tag: str,
+        limit: int = 500,
         __event_emitter__: Callable[[dict], None] = None,
     ) -> str:
         """
@@ -488,14 +489,20 @@ class Tools:
 
         Args:
             tag: The tag label to filter by (case-insensitive, exact match)
+            limit: Most articles to list, newest saved first (default 500).
+                   0 lists every article with the tag. Large tags run to
+                   thousands of articles (~240 bytes each), so leave the
+                   default in chat unless the user needs the whole set.
 
         Returns:
-            A markdown-formatted list of all matching articles with title,
-            ID, domain, URL, published date, and full tag list.
+            A markdown-formatted list of matching articles with title,
+            ID, domain, URL, published date, and full tag list. The header
+            gives the tag's full total; a footer says when the list was cut
+            short by limit.
         """
         import requests
 
-        MAX_ARTICLES = 500
+        MAX_ARTICLES = limit if limit and limit > 0 else float("inf")
         PER_PAGE = 30
 
         if not self.valves.WALLABAG_URL:
@@ -546,7 +553,8 @@ class Tools:
 
             lines = [f"## Articles tagged '{tag.strip()}' ({total} total)\n"]
 
-            for entry in articles[:MAX_ARTICLES]:
+            shown = articles if MAX_ARTICLES == float("inf") else articles[:MAX_ARTICLES]
+            for entry in shown:
                 title = entry.get("title") or "Untitled"
                 entry_id = entry.get("id")
                 domain = entry.get("domain_name") or ""
@@ -567,13 +575,13 @@ class Tools:
                     line += f"\n  Tags: {', '.join(entry_tags)}"
                 lines.append(line)
 
-            if len(articles) >= MAX_ARTICLES and total > MAX_ARTICLES:
-                lines.append(f"\n_(Showing first {MAX_ARTICLES} of {total} articles.)_")
+            if len(shown) < total:
+                lines.append(f"\n_(Showing first {len(shown)} of {total} articles. Pass limit=0 for all.)_")
 
             if __event_emitter__:
                 await __event_emitter__({
                     "type": "status",
-                    "data": {"description": f"Retrieved {min(len(articles), MAX_ARTICLES)} articles tagged '{tag.strip()}'"}
+                    "data": {"description": f"Retrieved {len(shown)} articles tagged '{tag.strip()}'"}
                 })
 
             return "\n".join(lines)

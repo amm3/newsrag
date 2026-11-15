@@ -10,6 +10,8 @@ File selection logic:
   - If an original (.pdf, .docx, etc.) exists alongside .md or .txt,
     only the text version is processed
   - Originals without a .md/.txt conversion are skipped
+  - Hidden files and AI summaries (*.ai-summary.md) are skipped; summaries
+    go to their own collection via summaries_ingest.py
 """
 
 import sys
@@ -27,7 +29,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from alert import send_alert
+from alert import send_alert, run_guarded
+from sync_state import claim_state, stamp_last_sync, write_state
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -38,6 +41,7 @@ from qdrant_client.models import (
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOGGING_FORMAT = '%(asctime)s:%(levelname)s:%(message)s'
 TEXT_EXTENSIONS = {'.md', '.txt'}
+SUMMARY_SUFFIX = '.ai-summary.md'
 
 
 def main():
@@ -76,11 +80,22 @@ def main():
     # State file location (per-collection to allow independent sync tracking)
     state_file = config_dir / f'.papers_sync_state_{collection_name}.json'
 
+    # Another run may already be working on this file: cron fires on a timer
+    # whether or not the last run finished, and a run started by hand knows
+    # nothing of either. Racing would lose one of the two runs' state.
+    if not args.dry_run and not claim_state(state_file):
+        return 0
+
     # Migrate legacy state file for the default 'papers' collection
     legacy_state_file = config_dir / '.papers_sync_state.json'
-    if not state_file.exists() and legacy_state_file.exists() and collection_name == 'papers':
-        legacy_state_file.rename(state_file)
-        logging.info(f"Migrated legacy state file to {state_file.name}")
+    if (not args.dry_run and not state_file.exists()
+            and legacy_state_file.exists() and collection_name == 'papers'):
+        try:
+            legacy_state_file.rename(state_file)
+            logging.info(f"Migrated legacy state file to {state_file.name}")
+        except FileNotFoundError:
+            # Another run migrated it between the check and the rename.
+            logging.debug("Legacy state file already migrated")
 
     # Initialize clients
     with warnings.catch_warnings():
@@ -124,6 +139,11 @@ def main():
 
     if not new_files:
         logging.info("No new documents to process")
+        # The run completed, it just had nothing to do. Stamp it anyway:
+        # last_sync has to mean 'a run finished' for health_check.py to
+        # tell a quiet source from a broken one.
+        if not args.dry_run:
+            stamp_last_sync(state_file)
         return 0
 
     # Process files
@@ -146,11 +166,10 @@ def main():
     # Save state
     if not args.dry_run:
         file_mtimes.update({p: int(Path(p).stat().st_mtime) for p in newly_processed})
-        with open(state_file, 'w') as f:
-            json.dump({
-                'file_mtimes': file_mtimes,
-                'last_sync': datetime.now(timezone.utc).isoformat()
-            }, f, indent=2)
+        write_state(state_file, {
+            'file_mtimes': file_mtimes,
+            'last_sync': datetime.now(timezone.utc).isoformat(),
+        })
 
     logging.warning(f"Completed: {len(newly_processed)} files, {total_chunks} chunks indexed")
     return 0
@@ -172,6 +191,11 @@ def find_documents(root_dir: Path) -> list[Path]:
         if not file_path.is_file():
             continue
         if file_path.name.startswith('.'):
+            continue
+        # summarize.py writes these beside each document. They are loaded into
+        # the 'summaries' collection, labelled as AI-written, and must not land
+        # here too as if they were documents in their own right.
+        if file_path.name.endswith(SUMMARY_SUFFIX):
             continue
         key = (file_path.parent, file_path.stem)
         stem_map.setdefault(key, {})[file_path.suffix.lower()] = file_path
@@ -269,6 +293,17 @@ def get_embeddings(texts: list[str], client: OpenAI, model: str) -> list[list[fl
     return [item.embedding for item in response.data]
 
 
+def file_id_for(relative_path: Path) -> str:
+    """The id every chunk of one document carries in its payload.
+
+    md5 of the path relative to --papers-dir, so a renamed or moved file is a
+    different document. papers_cull.py recomputes it from what is on disk to
+    tell live chunks from orphaned ones, so the two must never disagree --
+    which is why this is a function rather than a line in process_document.
+    """
+    return hashlib.md5(str(relative_path).encode()).hexdigest()
+
+
 def process_document(document_path: Path, root_dir: Path,
                      openai_client: OpenAI, qdrant: QdrantClient,
                      collection_name: str,
@@ -278,7 +313,7 @@ def process_document(document_path: Path, root_dir: Path,
 
     # Generate stable ID from file path relative to root
     relative_path = document_path.relative_to(root_dir)
-    file_id = hashlib.md5(str(relative_path).encode()).hexdigest()
+    file_id = file_id_for(relative_path)
 
     # Extract metadata
     document_name = document_path.stem
@@ -376,7 +411,4 @@ def log_fatal(msg, exit_code=-1):
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(1)
+    sys.exit(run_guarded('papers_ingest', main))

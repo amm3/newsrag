@@ -5,6 +5,13 @@ feeds_ingest.py - Ingest RSS/Atom feed articles into Qdrant
 Reads feed URLs from config/feeds.yaml, fetches new entries, optionally
 retrieves full article content via Firecrawl or trafilatura, chunks and
 embeds the text, then upserts to Qdrant with deduplication by entry GUID.
+
+The GUIDs already seen are kept in config/.feeds_sync_state.json as digests
+rather than verbatim -- see _guid_key() for why.
+
+A feed's optional 'kind' is carried through to the payload as 'feed_kind', so
+generated feeds (a scraper standing in for a site that publishes none) stay
+distinguishable from feeds the site publishes itself. Defaults to 'rss'.
 """
 
 import sys
@@ -26,7 +33,8 @@ import trafilatura
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from alert import send_alert
+from alert import send_alert, run_guarded
+from sync_state import claim_state, write_state
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
@@ -50,6 +58,8 @@ def main():
                            help="Reprocess specific feed URLs only")
     parser.add_argument("--dry-run", action="store_true", help="Don't write to Qdrant")
     parser.add_argument("--config", metavar='PATH', help="Path to feeds YAML config file")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Check the sync-state rules against known cases and exit")
     args = parser.parse_args()
 
     if args.vv:
@@ -58,6 +68,9 @@ def main():
         logging.basicConfig(format=LOGGING_FORMAT, datefmt=DEFAULT_TIME_FORMAT, level=logging.INFO)
     else:
         logging.basicConfig(format=LOGGING_FORMAT, datefmt=DEFAULT_TIME_FORMAT, level=logging.WARNING)
+
+    if args.self_test:
+        return self_test()
 
     # Load configuration
     config_dir = Path(os.environ.get('QDRANT_LOADER_CONFIG_DIR', Path(__file__).parent.parent / 'config'))
@@ -75,15 +88,21 @@ def main():
         log_fatal(f"Feeds config not found: {feeds_config_path}\n"
                   f"Create it from the example: cp config/feeds.yaml.example config/feeds.yaml")
 
-    with open(feeds_config_path) as f:
-        feeds_config = yaml.safe_load(f)
+    feeds_config = load_feeds_config(feeds_config_path)
 
     max_age_days = int(feeds_config.get('max_age_days', 0))
     min_retention_count = int(feeds_config.get('min_retention_count', 20))
 
-    all_feeds = feeds_config.get('feeds', [])
-    if not all_feeds:
+    raw_feeds = feeds_config.get('feeds', [])
+    if not raw_feeds:
         log_fatal("No feeds defined in feeds config")
+
+    all_feeds, feed_problems = validate_feeds(raw_feeds)
+    for problem in feed_problems:
+        logging.error(f"Skipping feed entry: {problem}")
+    if not all_feeds:
+        log_fatal(f"No usable feed entries in {feeds_config_path}:\n  "
+                  + "\n  ".join(feed_problems))
 
     # Firecrawl settings
     firecrawl_url = feeds_config.get('firecrawl_url', '').rstrip('/')
@@ -103,6 +122,12 @@ def main():
 
     state_file = config_dir / '.feeds_sync_state.json'
 
+    # Another run may already be working on this file: cron fires on a timer
+    # whether or not the last run finished, and a run started by hand knows
+    # nothing of either. Racing would lose one of the two runs' state.
+    if not args.dry_run and not claim_state(state_file):
+        return 0
+
     # Initialize clients
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='Api key is used with an insecure connection')
@@ -121,7 +146,19 @@ def main():
     if not args.full and state_file.exists():
         with open(state_file) as f:
             state = json.load(f)
-    processed_map = state.get('processed', {})
+    # Bring the ledger into its current shape before anything is compared
+    # against it. A targeted run knows only the feeds it was handed, so it must
+    # not be allowed to prune -- hence None rather than a partial set.
+    processed_map, hashed, dropped = migrate_state(
+        state.get('processed', {}),
+        None if args.feeds else {f['url'] for f in all_feeds},
+    )
+    if hashed:
+        logging.warning(f"Converted {hashed} stored identifier(s) to digests")
+    if dropped:
+        logging.warning(f"Dropped {len(dropped)} feed(s) no longer in "
+                        f"{feeds_config_path.name} from the sync state:\n  "
+                        + "\n  ".join(dropped))
 
     # Determine which feeds to process
     if args.feeds:
@@ -136,11 +173,13 @@ def main():
     # Process each feed
     total_entries = 0
     total_chunks = 0
+    feed_failures = 0
 
     for feed_def in target_feeds:
         feed_url = feed_def['url']
         feed_name = feed_def.get('name', feed_url)
         do_fetch = feed_def.get('fetch_content', True)
+        feed_kind = feed_def.get('kind', 'rss')
 
         logging.info(f"Fetching feed: {feed_name} ({feed_url})")
 
@@ -148,34 +187,42 @@ def main():
             parsed = feedparser.parse(feed_url)
         except Exception as e:
             logging.error(f"Failed to parse feed {feed_url}: {e}")
+            feed_failures += 1
             continue
 
         if parsed.bozo and parsed.bozo_exception:
             logging.warning(f"Feed parse warning for {feed_url}: {parsed.bozo_exception}")
+            # feedparser reports a dead host or unparseable body by setting bozo
+            # rather than raising. Bozo alone is common and harmless (a stray
+            # entity in otherwise fine XML); bozo with nothing to show for it is
+            # the shape of a feed that did not actually arrive.
+            if not parsed.entries:
+                feed_failures += 1
 
         entries = parsed.entries
         logging.debug(f"Feed has {len(entries)} entries")
 
-        # Known GUIDs for this feed
-        known_guids = set(processed_map.get(feed_url, []))
-        new_guids = []
+        # Digests of the entries already seen from this feed
+        known_keys = set(processed_map.get(feed_url, []))
+        new_keys = []
 
         for entry in entries:
             entry_id = _entry_id(entry)
-            if entry_id in known_guids:
+            guid_key = _guid_key(entry_id)
+            if guid_key in known_keys:
                 logging.debug(f"Skipping known entry: {entry_id}")
                 continue
 
             try:
                 chunks = process_entry(
-                    entry, feed_url, feed_name, do_fetch,
+                    entry, feed_url, feed_name, do_fetch, feed_kind,
                     firecrawl_url, firecrawl_api_key, firecrawl_timeout,
                     openai_client, qdrant, collection_name,
                     chunk_size, chunk_overlap, embedding_model, args.dry_run
                 )
                 total_chunks += chunks
                 total_entries += 1
-                new_guids.append(entry_id)
+                new_keys.append(guid_key)
                 title = getattr(entry, 'title', entry_id)[:60]
                 logging.info(f"  Indexed: {title} ({chunks} chunks)")
             except Exception as e:
@@ -183,31 +230,64 @@ def main():
 
         # Update state for this feed
         if not args.dry_run:
-            all_guids = list(known_guids | set(new_guids))
-            processed_map[feed_url] = all_guids
+            processed_map[feed_url] = list(known_keys | set(new_keys))
 
-        logging.info(f"Feed done: {feed_name} — {len(new_guids)} new entries")
+        logging.info(f"Feed done: {feed_name} — {len(new_keys)} new entries")
 
     # Save state
     if not args.dry_run and not args.feeds:
-        with open(state_file, 'w') as f:
-            json.dump({'processed': processed_map}, f, indent=2)
+        # last_sync marks a sync that ran to completion, which is the signal
+        # health_check.py watches for staleness. The --feeds branch below
+        # deliberately leaves it alone: a targeted rerun of one feed must not
+        # reset the clock and hide the fact that scheduled runs have stopped.
+        write_state(state_file, {
+            'processed': processed_map,
+            'last_sync': datetime.now(timezone.utc).isoformat(),
+        })
     elif not args.dry_run and args.feeds:
-        # Merge targeted feed updates into existing state
+        # Merge targeted feed updates into existing state, leaving last_sync as
+        # it was: a one-feed rerun must not make a stalled pipeline look healthy.
         if state_file.exists():
             with open(state_file) as f:
                 full_state = json.load(f)
         else:
-            full_state = {'processed': {}}
-        full_state['processed'].update(processed_map)
-        with open(state_file, 'w') as f:
-            json.dump(full_state, f, indent=2)
+            full_state = {}
+        merged = full_state.setdefault('processed', {})
+        merged.update(processed_map)
+        # The feeds this run was not asked about may still hold raw identifiers
+        # from an older state file; convert them too rather than writing a file
+        # in two shapes. Pruning stays off: this run cannot tell a retired feed
+        # from one it simply was not given.
+        full_state['processed'], hashed, _ = migrate_state(merged, None)
+        if hashed:
+            logging.warning(f"Converted {hashed} stored identifier(s) to digests")
+        write_state(state_file, full_state)
 
     logging.warning(f"Completed: {total_entries} new entries, {total_chunks} chunks indexed")
 
     if max_age_days > 0:
         feed_urls = [f['url'] for f in all_feeds]
         cull_old_entries(qdrant, collection_name, max_age_days, min_retention_count, feed_urls, args.dry_run)
+
+    # Problems worth mailing about that are not fatal: entries skipped as
+    # unusable, and the case where every feed failed. The latter matters because
+    # the run still "completes", so it stamps last_sync and leaves health_check
+    # reporting green while nothing at all is being indexed.
+    problems = list(feed_problems)
+    if target_feeds and feed_failures == len(target_feeds):
+        problems.append(f"every one of the {len(target_feeds)} feeds failed to fetch or "
+                        f"parse, so nothing was indexed - network, DNS or Firecrawl "
+                        f"may be down")
+
+    if problems:
+        summary = "\n".join(f"  - {p}" for p in problems)
+        logging.warning(f"{len(problems)} feed problem(s) this run:\n{summary}")
+        send_alert(
+            subject=f"[WARN] feeds_ingest: {len(problems)} "
+                    f"problem{'' if len(problems) == 1 else 's'} on {socket.gethostname()}",
+            body=f"The run finished and indexed what it could, but these problems "
+                 f"need attention (config: {feeds_config_path}):\n\n{summary}\n",
+        )
 
     return 0
 
@@ -217,7 +297,75 @@ def _entry_id(entry) -> str:
     return getattr(entry, 'id', None) or getattr(entry, 'link', None) or ''
 
 
+# Shape of a ledger key: 16 bytes of blake2b, hex. Anything in a loaded state
+# file that does not look like this is an identifier from before the ledger
+# stored digests, and gets converted on the way in.
+GUID_KEY_RE = re.compile(r'\A[0-9a-f]{32}\Z')
+
+
+def _guid_key(entry_id: str) -> str:
+    """Ledger key for an entry identifier.
+
+    The sync state is only ever asked one question -- "have I seen this id?" --
+    so it has no use for the identifier itself, and some feeds mint opaque
+    tokens well over a kilobyte long. Storing a 32-character digest instead
+    keeps the answer identical (the same id always hashes the same way, so
+    nothing is re-fetched or re-embedded) and takes the state file from tens of
+    megabytes of strings nothing reads to a fraction of that.
+
+    Deliberately NOT the same derivation as the Qdrant point id in
+    process_entry(), which is md5 over the raw entry_id and must stay that way
+    -- change it and every article already indexed reappears under a new id.
+
+    surrogatepass keeps a lone surrogate -- which a JSON state file can hold and
+    feedparser can produce -- from raising mid-conversion and taking the run
+    with it.
+    """
+    return hashlib.blake2b(entry_id.encode('utf-8', 'surrogatepass'),
+                           digest_size=16).hexdigest()
+
+
+def migrate_state(processed_map: dict,
+                  live_feed_urls: set[str] | None) -> tuple[dict, int, list[str]]:
+    """Normalise a loaded ledger. Returns (map, identifiers converted, feeds dropped).
+
+    Two jobs, both idempotent:
+
+    * Convert any stored value that is not already a digest, which is how a
+      state file written before _guid_key() existed is upgraded in place. The
+      conversion is one-way but safe, because both sides of the only comparison
+      that matters get hashed. An identifier that already looks like a digest --
+      a feed using bare md5 hex as its GUID -- is left alone and so re-indexes
+      once; that costs one upsert over the same point ids, not a duplicate,
+      since those ids come from the raw entry_id either way.
+
+    * Drop feeds that are not in live_feed_urls, whose entries can never be
+      matched again. Pass None to skip this: a caller that knows about only
+      some of the feeds (a --feeds run) would otherwise forget every feed it
+      was not asked about, and re-fetch and re-embed the lot on the next run.
+    """
+    migrated: dict[str, list[str]] = {}
+    converted = 0
+    dropped: list[str] = []
+
+    for feed_url, guids in processed_map.items():
+        if live_feed_urls is not None and feed_url not in live_feed_urls:
+            dropped.append(feed_url)
+            continue
+        keys = []
+        for guid in guids:
+            if isinstance(guid, str) and GUID_KEY_RE.match(guid):
+                keys.append(guid)
+            else:
+                keys.append(_guid_key(guid if isinstance(guid, str) else str(guid)))
+                converted += 1
+        migrated[feed_url] = keys
+
+    return migrated, converted, dropped
+
+
 def process_entry(entry, feed_url: str, feed_name: str, do_fetch: bool,
+                  feed_kind: str,
                   firecrawl_url: str, firecrawl_api_key: str, firecrawl_timeout: int,
                   openai_client: OpenAI, qdrant: QdrantClient, collection_name: str,
                   chunk_size: int, chunk_overlap: int, embedding_model: str,
@@ -286,6 +434,7 @@ def process_entry(entry, feed_url: str, feed_name: str, do_fetch: bool,
                 'url': link,
                 'feed_url': feed_url,
                 'feed_name': feed_name,
+                'feed_kind': feed_kind,
                 'published': published,
                 'published_ts': published_ts,
                 'author': author,
@@ -312,10 +461,24 @@ def _extract_feed_content(entry) -> str:
     if not raw:
         return ''
 
-    # Strip HTML
-    text = re.sub(r'<[^>]+>', ' ', raw)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    # Strip HTML, but keep paragraph boundaries. chunk_text() prefers to break
+    # on a blank line, and flattening every tag to a space -- as this did --
+    # left it nothing to find, so that preference never once applied to a feed.
+    # Block-level tags become a blank line, <br> a single newline, and every
+    # other tag a space, so words either side of an inline tag stay separate.
+    text = re.sub(r'(?i)<br\s*/?>', '\n', raw)
+    text = re.sub(
+        r'(?i)</?(?:h[1-6]|blockquote|figcaption|figure|section|article'
+        r'|table|tr|pre|div|li|ul|ol|dl|dd|dt|p)(?:\s[^>]*)?/?>',
+        '\n\n', text)
+    text = re.sub(r'<[^>]+>', ' ', text)
+
+    # Collapse horizontal runs, strip the spaces a break left at line edges,
+    # and cap blank lines at one, so '\n\n' is the only paragraph marker.
+    text = re.sub(r'[^\S\n]+', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def _fetch_content(url: str, firecrawl_url: str, firecrawl_api_key: str,
@@ -395,6 +558,75 @@ def _parse_date(entry) -> str:
     return ''
 
 
+
+def load_feeds_config(path: Path) -> dict:
+    """Parse the feeds YAML, failing with a message that names the offending line.
+
+    One unquoted colon in a feed name is enough to invalidate the whole file.
+    The YAMLError that causes used to escape main() and die as a bare traceback,
+    so a bad edit stopped the news index silently -- hence the explicit catch
+    and the line-and-caret detail in the alert.
+    """
+    try:
+        with open(path) as f:
+            config = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        log_fatal(f"Invalid YAML in {path}\n\n{_yaml_error_detail(path, e)}")
+    except OSError as e:
+        log_fatal(f"Could not read feeds config {path}: {e}")
+
+    if config is None:
+        log_fatal(f"Feeds config is empty: {path}")
+    if not isinstance(config, dict):
+        log_fatal(f"Feeds config must be a mapping of settings, "
+                  f"got {type(config).__name__}: {path}")
+    return config
+
+
+def _yaml_error_detail(path: Path, e: yaml.YAMLError) -> str:
+    """Describe a YAML error.
+
+    str(e) already names the file, line and column; add the source line itself
+    with a caret under the column, so the alert shows what to fix.
+    """
+    detail = str(e)
+    mark = getattr(e, 'problem_mark', None)
+    if mark is None:
+        return detail
+    try:
+        line = path.read_text().splitlines()[mark.line]
+    except (OSError, IndexError, UnicodeDecodeError):
+        return detail
+    return f"{detail}\n\n    {line}\n    {' ' * mark.column}^"
+
+
+def validate_feeds(raw_feeds) -> tuple[list[dict], list[str]]:
+    """Split feed entries into the usable ones and a description of each bad one.
+
+    A malformed entry is skipped rather than fatal, so one typo cannot stop
+    every other feed from being ingested. The caller alerts about whatever it
+    skipped -- a feed must not be able to drop out of the index quietly.
+    """
+    if not isinstance(raw_feeds, list):
+        return [], [f"'feeds' must be a list of entries, "
+                    f"got {type(raw_feeds).__name__}"]
+
+    good: list[dict] = []
+    problems: list[str] = []
+    for i, feed_def in enumerate(raw_feeds, start=1):
+        if not isinstance(feed_def, dict):
+            problems.append(f"entry {i}: expected a mapping, "
+                            f"got {type(feed_def).__name__} ({feed_def!r:.60})")
+            continue
+        url = feed_def.get('url')
+        if not isinstance(url, str) or not url.strip():
+            problems.append(f"entry {i} ({feed_def.get('name', '<unnamed>')}): "
+                            f"no usable 'url'")
+            continue
+        good.append(feed_def)
+    return good, problems
+
+
 # ---------------------------------------------------------------------------
 # Shared utilities (same pattern as wallabag_ingest.py)
 # ---------------------------------------------------------------------------
@@ -411,8 +643,10 @@ def ensure_collection(client: QdrantClient, collection_name: str, dimensions: in
         logging.info(f"Created collection: {collection_name}")
     else:
         logging.debug(f"Collection exists: {collection_name}")
-    # Payload indexes for efficient culling
-    for field_name, schema in [('published_ts', PayloadSchemaType.FLOAT), ('feed_url', PayloadSchemaType.KEYWORD)]:
+    # Payload indexes for efficient culling and for filtering by feed kind
+    for field_name, schema in [('published_ts', PayloadSchemaType.FLOAT),
+                               ('feed_url', PayloadSchemaType.KEYWORD),
+                               ('feed_kind', PayloadSchemaType.KEYWORD)]:
         try:
             client.create_payload_index(
                 collection_name=collection_name,
@@ -486,7 +720,12 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
         end = start + chunk_size
         if end < len(text):
             search_start = end - int(chunk_size * 0.2)
-            for punct in ['. ', '! ', '? ', '\n\n']:
+            # Paragraph break first, then sentence ends: a chunk that stops at
+            # a blank line holds whole paragraphs, where one stopping at the
+            # nearest '. ' saws through the middle of one. '\n\n' was last
+            # here and could never match anyway, since _extract_feed_content()
+            # had already collapsed every blank line into a single space.
+            for punct in ['\n\n', '. ', '! ', '? ']:
                 idx = text.rfind(punct, search_start, end)
                 if idx != -1:
                     end = idx + len(punct)
@@ -504,6 +743,89 @@ def get_embeddings(texts: list[str], client: OpenAI, model: str) -> list[list[fl
     return [item.embedding for item in response.data]
 
 
+def self_test() -> int:
+    """Check the ledger rules against known cases.
+
+    Same shape as tools/publish_scrub.py's --self-test, and for the same
+    reason: this is the part where a wrong answer is expensive and silent. A
+    ledger that stops matching does not fail -- it quietly re-fetches and
+    re-embeds every article it ever saw.
+    """
+    import tempfile
+
+    feed_a = 'https://news.example.com/atom?x=1'
+    feed_b = 'https://blog.example.com/rss'
+    retired = 'https://gone.example.com/feed'
+
+    # A token of the shape that made the state file big in the first place
+    long_token = 'CBMi' + 'Ab3Z' * 400
+    old_shape = {
+        feed_a: [long_token, 'https://news.example.com/story/1'],
+        feed_b: ['tag:blog.example.com,2026:post-7'],
+        retired: ['https://gone.example.com/post/1'],
+        'https://odd.example.com/feed': [12345],  # a feed that handed out a number
+    }
+    live = {feed_a, feed_b, 'https://odd.example.com/feed'}
+
+    full, converted, dropped = migrate_state(old_shape, live)
+    again, converted_again, _ = migrate_state(full, live)
+    targeted, _, targeted_dropped = migrate_state(old_shape, None)
+    every_key = [k for keys in full.values() for k in keys]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / '.feeds_sync_state.json'
+        write_state(path, {'processed': full, 'last_sync': '2026-11-11T04:00:00+00:00'})
+        with open(path) as f:
+            round_tripped = json.load(f)
+
+    cases = [
+        # Migration from the old raw-GUID shape
+        ("every stored value ends up a digest",
+         all(GUID_KEY_RE.match(k) for k in every_key), True),
+        ("converted count covers the kept feeds only",
+         converted, 4),
+        ("a non-string value converts instead of raising",
+         len(full['https://odd.example.com/feed']), 1),
+        ("migration is idempotent",
+         (again, converted_again), (full, 0)),
+        ("an opaque-token feed shrinks by an order of magnitude",
+         len(json.dumps(full[feed_a])) * 10 < len(json.dumps(old_shape[feed_a])), True),
+
+        # A known GUID still dedups once the ledger holds digests
+        ("a migrated raw GUID still matches",
+         _guid_key(long_token) in set(full[feed_a]), True),
+        ("so does a short one",
+         _guid_key('tag:blog.example.com,2026:post-7') in set(full[feed_b]), True),
+        ("an unseen GUID does not",
+         _guid_key('https://news.example.com/story/2') in set(full[feed_a]), False),
+        ("an entry with no id at all still gets a key",
+         bool(GUID_KEY_RE.match(_guid_key(''))), True),
+
+        # Pruning retired feeds, and only when the caller knows them all
+        ("a retired feed is dropped on a full run",
+         (dropped, retired in full), ([retired], False)),
+        ("a --feeds run prunes nothing",
+         (targeted_dropped, sorted(targeted)), ([], sorted(old_shape))),
+
+        # The key health_check.py reads survives a write
+        ("last_sync survives the state write",
+         round_tripped.get('last_sync'), '2026-11-11T04:00:00+00:00'),
+        ("and so does the ledger beside it",
+         round_tripped.get('processed'), full),
+    ]
+
+    failures = 0
+    for label, got, want in cases:
+        if got != want:
+            print(f"  FAIL {label}: {got!r} != {want!r}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"  ok   {label}")
+
+    print("self-test failed" if failures else "self-test passed")
+    return 1 if failures else 0
+
+
 def log_fatal(msg, exit_code=-1):
     logging.critical(f"Fatal Err: {msg}")
     send_alert(
@@ -514,7 +836,4 @@ def log_fatal(msg, exit_code=-1):
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(1)
+    sys.exit(run_guarded('feeds_ingest', main))

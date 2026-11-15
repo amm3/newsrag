@@ -226,6 +226,50 @@ Use the `run.sh` wrapper script, which activates the venv automatically:
 ./run.sh papers --files /path/to/doc.pdf /path/to/other.txt -v
 ```
 
+**Deletions and renames.** `papers` only ever adds. It embeds new and changed
+files and never notices one that has gone, so a deleted or renamed document
+stays searchable under its old path. `papers-cull` removes those chunks, and
+their entries in the collection's state file. Run it with the same
+`--papers-dir` and `--collection` as the `papers` run it follows:
+
+```bash
+# List what would be removed
+./run.sh papers-cull --papers-dir /path/to/papers --collection papers --dry-run -v
+
+# Remove it
+./run.sh papers-cull --papers-dir /path/to/papers --collection papers -v
+```
+
+A chunk stays when `papers` would select its file today, by the same rules and
+the same `file_id` (md5 of the path relative to `--papers-dir`). Every other
+chunk with a `file_id` is removed:
+- files that were deleted;
+- files that were renamed or moved, since the new path was embedded as a new
+  document;
+- a `foo.txt` once a `foo.md` sits beside it;
+- AI summaries (`*.ai-summary.md`). `papers` skips these now, because they
+  belong in `summaries`, but older versions embedded them as documents.
+
+Points from other loaders, and points with no `file_id`, are left alone.
+
+**After upgrading from a version that embedded AI summaries:** summaries made up
+about half the files in each collection, so the first cull removes about half
+of each one's files. Where that is more than half, the mass-delete guard
+described below refuses. Check the `--dry-run` list, then run that collection's
+cull once by hand with `--force`.
+
+Two guards refuse the whole run when the folder looks unreadable rather than
+tidied. A refused run sends mail and changes nothing. They trip when:
+- no files are found at all while chunks from the folder are indexed, which is
+  what an unmounted NAS looks like;
+- more than half of the indexed files are gone at once, and more than 10 of
+  them.
+
+Pass `--force` when the files really are gone. A wrong cull fixes itself: the
+cull drops the file's state entry, so if the file comes back, the next `papers`
+run embeds it again. `--self-test` checks these rules against an in-memory
+Qdrant.
+
 ### AI Summaries
 
 Two-phase pipeline that generates AI summaries for podcast transcripts and
@@ -257,7 +301,9 @@ the prompt (`0` disables the lookup, as does `--no-tag-vocab`).
 them into the `summaries` collection, tagged with `source_type` (`podcast`
 or `paper`). Re-running after you hand-edit a summary picks up the change
 automatically via the same mtime-based incremental sync every other loader
-uses.
+uses. Hidden files are skipped, so the `._<name>.ai-summary.md` AppleDouble
+files a Mac leaves on a network share are not loaded as summaries. `papers`
+skips `.ai-summary.md` files altogether, so a summary is only ever indexed here.
 
 ```bash
 # Phase 1: generate summaries (costs an LLM call per new file)
@@ -280,6 +326,21 @@ uses.
 ./run.sh summarize --type podcast --podcast-dir /path/to/podcasts --dry-run -v
 ./run.sh summaries --podcast-dir /path/to/podcasts --papers-dir /path/to/papers --dry-run -v
 ```
+
+`summaries` has the same blind spot as `papers`: it never removes anything.
+`summaries-cull` removes the chunks of `.ai-summary.md` files that no longer
+exist, and their entries in `.summaries_sync_state.json`. It follows the same
+rules and has the same guards as [`papers-cull`](#papers--documents). Give it
+the same directories as `summaries`. Only the roots it is given are culled, so
+a run with only `--papers-dir` never touches podcast summaries.
+
+```bash
+./run.sh summaries-cull --podcast-dir /path/to/podcasts --papers-dir /path/to/papers --dry-run -v
+./run.sh summaries-cull --podcast-dir /path/to/podcasts --papers-dir /path/to/papers -v
+```
+
+The cull goes by the summary file, not the document it summarizes. A summary
+that is still on disk stays indexed even after its source document is deleted.
 
 ### RSS/Atom News Feeds
 
@@ -354,7 +415,9 @@ chat's existing points are deleted and replaced on every re-index (idempotent).
 Incremental sync state is stored in `config/`:
 - `.wallabag_sync_state.json`
 - `.podcast_sync_state.json`
-- `.papers_sync_state.json`
+- `.papers_sync_state_<collection>.json`, one per `--collection` (an older
+  `.papers_sync_state.json` is renamed to `.papers_sync_state_papers.json` on
+  the first run)
 - `.summaries_sync_state.json`
 - `.feeds_sync_state.json`
 - `.kindle_sync_state.json`
@@ -362,12 +425,66 @@ Incremental sync state is stored in `config/`:
 
 Delete a state file to force a full re-sync for that source.
 
+A run claims its state file for the duration, via a `<state file>.lock` beside
+it, so two runs of the same loader cannot overlap and lose each other's work.
+Nothing schedules the loaders exclusively — cron fires on a timer whether or not
+the last run finished, and a run started by hand knows nothing of either — so
+the second run logs which pid holds the file and exits 0 without doing anything.
+A skipped run deliberately does **not** stamp `last_sync`, so if every run were
+to skip, the source would go stale and `./run.sh health` would say so.
+
+The lock is keyed on the state file, not the command, because those do not
+correspond: `papers` writes a different file per `--collection` and those runs
+may safely overlap, while `summaries` takes the same flag and writes one file
+regardless, so those runs may not. A `--dry-run` writes nothing, so it neither
+claims the file nor is turned away from it. Set `QDRANT_LOADER_NO_LOCK=1` to
+disable the whole mechanism — worth knowing if `config/` ever lives on NFS,
+where `flock` is unreliable. Locks are released by the kernel when a run ends,
+including if it is killed, so there is never a stale lock to clear by hand.
+
+The loaders never remove anything from a `file_mtimes` map. `papers-cull` and
+`summaries-cull` do. They drop the entry of every file under their root that the
+loader would no longer select, and leave the rest of the file alone, `last_sync`
+included, because a cull is not a sync. Each cull claims the same lock as the
+loader whose file it edits, so a cull and a `papers` run for the same collection
+never overlap. Entries under a root spelled differently from the one the cull
+was given are kept, since the cull cannot tell whether they are live.
+
+Each of these carries a `last_sync` timestamp, written when a run completes;
+`./run.sh health` reads it to tell a stalled pipeline from a healthy one. A
+`--dry-run` writes no state, so it never counts as a sync. A `.feeds_sync_state.json`
+written before `last_sync` existed falls back to the file's mtime until the next
+full run rewrites it.
+
+`.feeds_sync_state.json` records a 32-character digest of each entry GUID rather
+than the GUID itself. Nothing ever reads those identifiers back — they exist only
+to answer "seen this one?" — and feeds that mint opaque tokens over a kilobyte
+long had grown the file to 38 MB, 36 MB of it identifier text. The same ledger as
+digests is about 8 MB. A file in the older shape is converted in place on the
+first run, which changes no dedup decisions, and feeds no longer listed in
+`feeds.yaml` are dropped from it. A `--feeds` run converts but never drops, since
+it is told only about the feeds it was asked to reprocess.
+
+`config/.health_state.json` lives alongside them but is not sync state — it holds
+the health check's alert-suppression timestamps. Delete it to re-arm the alerts.
+
 ---
 
 ## Alerting
 
-All loaders send an email when they exit with a fatal error (missing env vars,
-authentication failure, etc.). Configure SMTP in `config/.env`:
+Every loader sends an email when it fails. Two mechanisms cover that:
+
+- **Handled errors.** Each loader calls `log_fatal()` for the failures it
+  anticipates — missing env vars, an absent config file, an authentication
+  failure — which logs, mails and exits.
+- **Everything else.** `main()` runs inside `run_guarded()`
+  ([scripts/alert.py](scripts/alert.py)), so an exception no one anticipated
+  mails the traceback instead of dying as stderr that cron throws away. This
+  matters because a cron line like the ones below redirects stderr into a log
+  file: without it, an invalid `config/feeds.yaml` can stop an index for days
+  in complete silence.
+
+Configure SMTP in `config/.env`:
 
 ```ini
 ALERT_SMTP_HOST=smtp.gmail.com
@@ -383,6 +500,60 @@ behave exactly as before with no delay or error.
 
 > **Gmail users:** generate an App Password at myaccount.google.com → Security →
 > App passwords. Do not use your account login password.
+
+### Health check
+
+A failure that mails is the easy case. The harder one is a source that has
+quietly stopped advancing — runs crashing, cron no longer firing, an upstream
+that went away. Each loader stamps `last_sync` into its state file on every run
+that finishes, including the runs that find nothing new to do, so a stale stamp
+means runs have stopped rather than that the source has been quiet:
+
+```bash
+./run.sh health -v
+```
+
+It reports every watched source, mails once when one falls behind, exits
+non-zero while anything is stale, and mails again when the source recovers.
+Repeat alerts are rate-limited by `HEALTH_REALERT_HOURS` so a frequent cron
+doesn't mail every run for as long as something stays broken. Suppression state
+lives in `config/.health_state.json`.
+
+```ini
+HEALTH_CHECKS=feeds                  # feeds, wallabag, podcasts, papers, summaries, kindle, openwebui
+HEALTH_STALE_HOURS=36                # alert once a source is this far behind
+# HEALTH_STALE_HOURS_FEEDS=6         # per-source override
+HEALTH_REALERT_HOURS=24              # minimum gap between repeat alerts
+```
+
+Because `papers` is run once per collection, with a state file each, listing it
+covers every collection that has one — judged separately, so a collection that
+stops syncing cannot hide behind one that is still running. `papers:<collection>`
+names a single one, and is how to watch a collection that has yet to write state.
+Thresholds resolve most-specific-first:
+`HEALTH_STALE_HOURS_PAPERS_MY_THOUGHTS`, then `HEALTH_STALE_HOURS_PAPERS`, then
+`HEALTH_STALE_HOURS`.
+
+Set the threshold above the gap between scheduled runs, with room for one
+missed run and the runtime itself: a feed ingest every two hours that takes up
+to 45 minutes wants about 6, not 36. List only sources you run on a schedule —
+one you run by hand has no recent stamp and would look permanently stale.
+
+Give the check its own cron line rather than appending it to a script that runs
+the loaders. A watchdog inside the thing it watches stops when that stops, and
+it should run more often than the ingests so a missed run is noticed in hours.
+
+`--dry-run` reports findings without mailing or recording them; `--force`
+ignores the rate limit. Both are useful for confirming the thresholds do what
+you expect. Exit status is 0 when everything is fresh and 1 while anything is
+stale — including while its alert is being rate-limited, so a suppressed alert
+never looks like success.
+
+Two limits worth knowing. It runs from cron, so it cannot report that cron
+itself has stopped. And because `feeds_ingest` stamps `last_sync` on any run
+that finishes, a run where every single feed failed to fetch would otherwise
+look healthy — that case is covered separately, by the loader itself mailing a
+`[WARN] feeds_ingest` summary when no feed yielded anything.
 
 ---
 
@@ -437,9 +608,27 @@ Always cite which source you're drawing from when using retrieved information.
 0 3 * * * youruser /path/to/qdrant_loader/run.sh wallabag -v >> /var/log/qdrant-ingest.log 2>&1
 15 3 * * * youruser /path/to/qdrant_loader/run.sh podcasts --podcast-dir /path/to/podcasts -v >> /var/log/qdrant-ingest.log 2>&1
 30 3 * * * youruser /path/to/qdrant_loader/run.sh feeds -v >> /var/log/qdrant-ingest.log 2>&1
+
+# Notice a source that has stopped syncing (see Alerting → Health check)
+*/30 * * * * youruser /path/to/qdrant_loader/run.sh health >> /var/log/qdrant-ingest.log 2>&1
 ```
 
 Papers and Kindle highlights are typically ingested on-demand rather than on a schedule.
+If you do schedule `papers` or `summaries`, run the matching cull right after it,
+with the same arguments. Otherwise deleted and renamed files stay searchable:
+
+```bash
+*/15 * * * * youruser { /path/to/qdrant_loader/run.sh papers --papers-dir /path/to/papers --collection papers -v; /path/to/qdrant_loader/run.sh papers-cull --papers-dir /path/to/papers --collection papers -v; } >> /var/log/qdrant-ingest.log 2>&1
+```
+
+A cull is cheap: one scroll of the collection's ids and paths, and the same disk
+walk `papers` already does. If a guard refuses, every run mails until you look,
+so use a slower schedule if that would be too much.
+
+Note that `2>&1` into a log file is why the health check is worth having: it
+sends a failing run's traceback somewhere nobody looks. The loaders mail on
+their own account, and the health check covers the case where a run stops
+happening at all.
 
 ---
 
@@ -570,10 +759,15 @@ qdrant_loader/
     ├── wallabag_client.py    # Shared Wallabag API client
     ├── podcast_ingest.py     # Podcast transcript ingestion
     ├── papers_ingest.py      # Papers/document ingestion
+    ├── papers_cull.py        # Removes chunks of deleted/renamed papers (./run.sh papers-cull)
     ├── summarize.py          # AI summary generation (Phase 1, no Qdrant writes)
     ├── summaries_ingest.py   # AI summary ingestion into Qdrant (Phase 2)
+    ├── summaries_cull.py     # Removes chunks of deleted summaries (./run.sh summaries-cull)
+    ├── file_cull.py          # Shared cull rules, guards and --self-test
     ├── feeds_ingest.py       # RSS/Atom feed ingestion
     ├── kindle_ingest.py      # Kindle highlights ingestion
+    ├── alert.py              # Shared email alerting + the top-level crash guard
+    ├── health_check.py       # Staleness watchdog (./run.sh health)
     └── openwebui_tool.py     # OpenWebUI Tool code
 ```
 

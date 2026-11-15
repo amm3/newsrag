@@ -27,7 +27,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from alert import send_alert
+from alert import send_alert, run_guarded
+from sync_state import claim_state, stamp_last_sync, write_state
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -75,6 +76,12 @@ def main():
 
     # State file (single file — this loader always targets one 'summaries' collection)
     state_file = config_dir / '.summaries_sync_state.json'
+
+    # Another run may already be working on this file: cron fires on a timer
+    # whether or not the last run finished, and a run started by hand knows
+    # nothing of either. Racing would lose one of the two runs' state.
+    if not args.dry_run and not claim_state(state_file):
+        return 0
 
     # Initialize clients
     with warnings.catch_warnings():
@@ -138,6 +145,11 @@ def main():
 
     if not new_files:
         logging.info("No new summaries to process")
+        # The run completed, it just had nothing to do. Stamp it anyway:
+        # last_sync has to mean 'a run finished' for health_check.py to
+        # tell a quiet source from a broken one.
+        if not args.dry_run:
+            stamp_last_sync(state_file)
         return 0
 
     # Process files
@@ -160,19 +172,24 @@ def main():
     # Save state
     if not args.dry_run:
         file_mtimes.update({p: int(Path(p).stat().st_mtime) for p in newly_processed})
-        with open(state_file, 'w') as f:
-            json.dump({
-                'file_mtimes': file_mtimes,
-                'last_sync': datetime.now(timezone.utc).isoformat()
-            }, f, indent=2)
+        write_state(state_file, {
+            'file_mtimes': file_mtimes,
+            'last_sync': datetime.now(timezone.utc).isoformat(),
+        })
 
     logging.warning(f"Completed: {len(newly_processed)} files, {total_chunks} chunks indexed")
     return 0
 
 
 def find_summaries(root_dir: Path) -> list[Path]:
-    """Find all .ai-summary.md files under root_dir."""
-    return sorted(root_dir.rglob("*.ai-summary.md"))
+    """Find all .ai-summary.md files under root_dir.
+
+    Hidden files are skipped, as papers_ingest.py skips them. A Mac browsing
+    the share leaves AppleDouble files named ._<name>.ai-summary.md, which
+    hold resource-fork bytes rather than a summary.
+    """
+    return sorted(p for p in root_dir.rglob("*.ai-summary.md")
+                  if not p.name.startswith('.'))
 
 
 def ensure_collection(client: QdrantClient, collection_name: str, dimensions: int = 1536):
@@ -254,6 +271,15 @@ def get_embeddings(texts: list[str], client: OpenAI, model: str) -> list[list[fl
     return [item.embedding for item in response.data]
 
 
+def file_id_for(source_type: str, relative_path: Path) -> str:
+    """The id every chunk of one summary file carries in its payload.
+
+    summaries_cull.py recomputes it from what is on disk to tell live chunks
+    from orphaned ones, so the two must never disagree.
+    """
+    return hashlib.md5(f"{source_type}:{relative_path}".encode()).hexdigest()
+
+
 def process_summary(summary_path: Path, root_dir: Path, source_type: str,
                      openai_client: OpenAI, qdrant: QdrantClient,
                      collection_name: str,
@@ -265,7 +291,7 @@ def process_summary(summary_path: Path, root_dir: Path, source_type: str,
     # (prefixed with source_type since podcast-dir and papers-dir are
     # scanned into the same collection and could otherwise collide)
     relative_path = summary_path.relative_to(root_dir)
-    file_id = hashlib.md5(f"{source_type}:{relative_path}".encode()).hexdigest()
+    file_id = file_id_for(source_type, relative_path)
 
     # Recover the original episode/document name: <name>.ai-summary.md ->
     # stem strips .md, stem again strips .ai-summary
@@ -360,7 +386,4 @@ def log_fatal(msg, exit_code=-1):
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(1)
+    sys.exit(run_guarded('summaries_ingest', main))

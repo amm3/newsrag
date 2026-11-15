@@ -30,7 +30,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from alert import send_alert
+from alert import send_alert, run_guarded
+from sync_state import claim_state, stamp_last_sync, write_state
 from wallabag_client import WallabagClient
 from openai import OpenAI
 from qdrant_client import QdrantClient
@@ -84,6 +85,16 @@ def main():
     # State file location
     state_file = config_dir / '.wallabag_sync_state.json'
 
+    # Another run may already be working on this file: cron fires on a timer
+    # whether or not the last run finished, and a run started by hand knows
+    # nothing of either. Racing would lose one of the two runs' state.
+    # The claim mirrors this loader's state-write condition exactly: a
+    # targeted reprocess writes no state, so it neither needs the lock nor
+    # should be turned away by one.
+    if not args.dry_run and not args.entries and not args.annotated_only \
+            and not claim_state(state_file):
+        return 0
+
     # Initialize clients
     wallabag = WallabagClient(
         url=os.environ['WALLABAG_URL'],
@@ -136,6 +147,11 @@ def main():
 
     if not articles:
         logging.info("No new articles to process")
+        # The run completed, it just had nothing to do. Stamp it anyway:
+        # last_sync has to mean 'a run finished' for health_check.py to
+        # tell a quiet source from a broken one.
+        if not args.dry_run and not args.entries and not args.annotated_only:
+            stamp_last_sync(state_file)
         return 0
 
     # Process articles
@@ -158,8 +174,7 @@ def main():
 
     # Save state (skip for targeted reprocessing)
     if not args.dry_run and not args.entries and not args.annotated_only:
-        with open(state_file, 'w') as f:
-            json.dump({'last_sync': datetime.now(timezone.utc).isoformat()}, f)
+        write_state(state_file, {'last_sync': datetime.now(timezone.utc).isoformat()})
 
     logging.warning(
         f"Completed: {len(articles)} articles, {total_chunks} chunks, "
@@ -419,7 +434,4 @@ def log_fatal(msg, exit_code=-1):
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(1)
+    sys.exit(run_guarded('wallabag_ingest', main))

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from alert import send_alert
+from alert import send_alert, run_guarded
 from wallabag_client import WallabagClient
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -148,4 +148,4 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_guarded('wallabag_cull', main))

@@ -64,7 +64,8 @@ Fetch all Wallabag articles that carry a specific tag, using the Wallabag API fo
 - **When to use**: When the user asks for all articles tagged with something (e.g. "show me everything tagged 'ai'", "list my articles tagged 'recipe'"). This returns the full set — not a semantic top-K — so prefer it over `search_knowledge` when completeness matters more than relevance ranking.
 - **Parameters**:
   - `tag` — The tag label to filter by (case-insensitive, exact match). One tag per call.
-- **Notes**: Paginates automatically through all results (up to 500 articles). Results include article ID, title, domain, URL, published date, and all tags on the article. Requires Wallabag credentials to be configured.
+  - `limit` — Optional. Most articles to list, newest saved first (default 500). `0` lists every article with the tag. Big tags run to thousands of articles, so keep the default unless the user truly needs the whole set; the header always gives the full total, and a footer says when the list was cut short.
+- **Notes**: Paginates automatically through the results, up to `limit`. Results include article ID, title, domain, URL, published date, and all tags on the article. Requires Wallabag credentials to be configured.
 
 ### `add_tag_to_article`
 Add a single tag to a Wallabag article.

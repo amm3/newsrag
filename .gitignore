@@ -4,9 +4,17 @@ venv/
 
 # Configuration with secrets
 config/.env
+config/.env.bak*
 
-# Sync state files
-config/.*_state.json
+# Sync state files (incl. per-collection ones like .papers_sync_state_misc.json)
+config/.*_state*.json
+
+# Lock files, created at runtime beside the state file they guard
+config/*.lock
+
+# Half-written state left by a crashed atomic write. A feeds state file is
+# keyed by feed URL, so this must not reach the public mirror either.
+config/*.tmp
 
 # Python
 __pycache__/
@@ -28,3 +36,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .claude/
+
+# Feed / scrape target list (a personal reading list, not for the public mirror)
+config/feeds.yaml

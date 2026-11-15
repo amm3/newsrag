@@ -39,6 +39,15 @@ min_retention_count: 20
 # Per-feed options:
 #   fetch_content: true   (default) Fetch full article if feed content is short
 #   fetch_content: false  Use only whatever the feed provides; never fetch page
+#
+#   kind: rss             (default) A feed the site publishes itself
+#   kind: scraped         A generated feed standing in for a site that
+#                         publishes none. Written to the payload as
+#                         'feed_kind' and indexed, so scraped articles can be
+#                         filtered or audited separately at retrieval time.
+#                         Pair it with fetch_content: false -- whatever built
+#                         the feed has already done the extraction, so there is
+#                         nothing to gain by fetching the page a second time.
 
 feeds:
   - url: https://example.com/feed.rss
@@ -55,4 +64,11 @@ feeds:
   - url: https://feeds.arstechnica.com/arstechnica/index
     name: Ars Technica
     # Ars provides full article text in the feed
+    fetch_content: false
+
+  # A site with no feed of its own. Something else scrapes it and publishes
+  # the RSS; this loader then treats it like any other feed.
+  - url: https://static-lan.example.com/scraped/example-site.xml
+    name: Example Site
+    kind: scraped
     fetch_content: false
